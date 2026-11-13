@@ -71,6 +71,25 @@ function flattenToText(value: unknown): string {
     const rec = value as Record<string, unknown>;
     const preferredKeys = ['text', 'content', 'body', 'summary', 'description', 'title'];
     const parts: string[] = [];
+
+    // Preserve TRINITY Core RAG resonance & tier context if present alongside content
+    const trinityMeta: string[] = [];
+    if (typeof rec.source === 'string' && rec.source.trim()) {
+      trinityMeta.push(`source=${rec.source.trim()}`);
+    }
+    if (typeof rec.tier === 'string' && rec.tier.trim()) {
+      trinityMeta.push(`tier=${rec.tier.trim()}`);
+    }
+    if (typeof rec.kappa === 'number') {
+      trinityMeta.push(`kappa=${rec.kappa.toFixed(3)}`);
+    }
+    if (typeof rec.score === 'number') {
+      trinityMeta.push(`score=${rec.score.toFixed(3)}`);
+    }
+    if (trinityMeta.length > 0 && ('content' in rec || 'text' in rec)) {
+      parts.push(`[TRINITY ${trinityMeta.join(' | ')}]`);
+    }
+
     for (const key of preferredKeys) {
       if (key in rec && typeof rec[key] === 'string' && (rec[key] as string).trim()) {
         parts.push(`${key === 'title' ? '# ' : ''}${(rec[key] as string).trim()}`);

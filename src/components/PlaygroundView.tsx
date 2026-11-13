@@ -43,6 +43,7 @@ interface PlaygroundViewProps {
     method: 'GET' | 'POST';
     parserMode: RagParserMode;
     jsonPath?: string;
+    requestBody?: string;
   }) => Promise<void>;
   onSyncRagConnector: (id: string) => Promise<void>;
   onToggleRagConnector: (connector: RagConnector) => Promise<void>;
@@ -83,6 +84,7 @@ export function PlaygroundView({
   const [connMethod, setConnMethod] = useState<'GET' | 'POST'>('GET');
   const [connParser, setConnParser] = useState<RagParserMode>('auto');
   const [connJsonPath, setConnJsonPath] = useState('');
+  const [connRequestBody, setConnRequestBody] = useState('');
   const [connError, setConnError] = useState<string | null>(null);
   const [syncingId, setSyncingId] = useState<string | null>(null);
   const [creatingConn, setCreatingConn] = useState(false);
@@ -98,6 +100,44 @@ export function PlaygroundView({
     await onRunRoute(samplePrompt, useRag);
   };
 
+  const applyTrinityPreset = (endpoint: 'query' | 'context') => {
+    setConnError(null);
+    if (endpoint === 'query') {
+      setConnName('TRINITY :7700 /query');
+      setConnUrl('http://127.0.0.1:7700/query');
+      setConnMethod('POST');
+      setConnParser('json');
+      setConnJsonPath('results');
+      setConnRequestBody(
+        JSON.stringify(
+          {
+            query_text: 'Semantic Router architecture and UAGL tiers',
+            k: 5,
+            min_kappa: 0.0,
+          },
+          null,
+          2
+        )
+      );
+    } else {
+      setConnName('TRINITY :7700 /context');
+      setConnUrl('http://127.0.0.1:7700/context');
+      setConnMethod('POST');
+      setConnParser('json');
+      setConnJsonPath('context');
+      setConnRequestBody(
+        JSON.stringify(
+          {
+            query_text: 'Semantic Router architecture and UAGL tiers',
+            k: 5,
+          },
+          null,
+          2
+        )
+      );
+    }
+  };
+
   const handleAddConnector = async (e: React.FormEvent) => {
     e.preventDefault();
     setConnError(null);
@@ -109,10 +149,12 @@ export function PlaygroundView({
         method: connMethod,
         parserMode: connParser,
         jsonPath: connJsonPath.trim() || undefined,
+        requestBody: connMethod === 'POST' && connRequestBody.trim() ? connRequestBody : undefined,
       });
       setConnName('');
       setConnUrl('');
       setConnJsonPath('');
+      setConnRequestBody('');
     } catch (err) {
       setConnError((err as Error).message || 'Failed to add RAG connector');
     } finally {
@@ -260,15 +302,31 @@ export function PlaygroundView({
           {/* External Webhook / URL RAG Connector Drawer */}
           {connectorsOpen && (
             <div className="mt-5 pt-5 border-t border-slate-200 space-y-4">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900">
                     External Webhook &amp; URL RAG Connectors
                   </h2>
                   <p className="text-xs text-slate-500 mt-0.5">
-                    Fetch HTTP/HTTPS JSON feeds, webhooks, or web pages, chunk them, and index via
+                    Fetch HTTP/HTTPS JSON feeds, webhooks, or TRINITY :7700 endpoints and index via
                     EmbeddingsBridge for unified HTTP + MCP retrieval.
                   </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => applyTrinityPreset('query')}
+                    className="px-2.5 py-1 text-[11px] font-mono font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded whitespace-nowrap shrink-0"
+                  >
+                    Preset: TRINITY :7700 /query
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => applyTrinityPreset('context')}
+                    className="px-2.5 py-1 text-[11px] font-mono font-medium text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded whitespace-nowrap shrink-0"
+                  >
+                    Preset: TRINITY :7700 /context
+                  </button>
                 </div>
               </div>
 
@@ -442,6 +500,22 @@ export function PlaygroundView({
                     Add
                   </button>
                 </div>
+                {connMethod === 'POST' && (
+                  <div className="sm:col-span-12 pt-1">
+                    <label htmlFor="rag-conn-body" className="block text-[11px] font-medium text-slate-700 mb-1">
+                      POST JSON Request Body (e.g. TRINITY <code className="font-mono">/query</code> or{' '}
+                      <code className="font-mono">/context</code> payload)
+                    </label>
+                    <textarea
+                      id="rag-conn-body"
+                      rows={2}
+                      value={connRequestBody}
+                      onChange={(e) => setConnRequestBody(e.target.value)}
+                      placeholder='{"query_text":"Semantic Router architecture","k":5}'
+                      className="w-full px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded"
+                    />
+                  </div>
+                )}
               </form>
             </div>
           )}

@@ -574,6 +574,85 @@ async function startServer() {
     }
   });
 
+  // --- TRINITY :7700 RAG Bridge API routes ---
+
+  app.get('/api/trinity/health', async (req, res) => {
+    try {
+      const trinityUrl =
+        typeof req.query.trinityUrl === 'string' ? req.query.trinityUrl : undefined;
+      const result = await service.getTrinityHealth(trinityUrl);
+      res.json(result);
+    } catch (err) {
+      res.status(502).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/trinity/query', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        queryText?: string;
+        query_text?: string;
+        k?: number;
+        tierFilter?: string | null;
+        minKappa?: number;
+        trinityUrl?: string | null;
+      };
+      const result = await service.trinityQuery({
+        queryText: body.queryText ?? body.query_text ?? '',
+        k: body.k,
+        tierFilter: body.tierFilter,
+        minKappa: body.minKappa,
+        trinityUrl: body.trinityUrl,
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(502).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/trinity/context', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        queryText?: string;
+        query_text?: string;
+        k?: number;
+        trinityUrl?: string | null;
+      };
+      const result = await service.trinityContext({
+        queryText: body.queryText ?? body.query_text ?? '',
+        k: body.k,
+        trinityUrl: body.trinityUrl,
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(502).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/trinity/ingest', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        content?: string;
+        source?: string;
+        sessionId?: string;
+        kappa?: number;
+        metadata?: Record<string, unknown>;
+        trinityUrl?: string | null;
+      };
+      const result = await service.trinityIngest({
+        content: body.content ?? '',
+        source: body.source,
+        sessionId: body.sessionId,
+        kappa: body.kappa,
+        metadata: body.metadata,
+        trinityUrl: body.trinityUrl,
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(502).json({ error: (err as Error).message });
+    }
+  });
+
   // --- Optional MCP Server (stdin/stdout) Live Bridge ---
 
   app.get('/api/mcp/logs', (_req, res) => {

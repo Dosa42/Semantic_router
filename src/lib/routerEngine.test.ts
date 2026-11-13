@@ -1,5 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
+import {
+  generateCodexCliTomlSnippet,
+  generateCodexMcpAddCommand,
+  MCP_JSONRPC_PRESETS,
+} from './sdkCodeGen';
 import {
   aggregateScores,
   blendScore,
@@ -579,4 +585,181 @@ test('Architecture Library Knowledge persists dual Mermaid blueprints and export
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('ragEngine flattens TRINITY /query results preserving source, tier, kappa, and content', () => {
+  const payload = JSON.stringify({
+    query: 'UAGL tier transitions',
+    k: 1,
+    results: [
+      {
+        chunk_id: 'c-101',
+        source: 'uagl_spec.md',
+        tier: 'HOT',
+        kappa: 0.912,
+        score: 0.875,
+        content: 'UAGL promotes high-kappa chunks into HOT RAM tier during resonance consolidation.',
+      },
+    ],
+  });
+
+  const extracted = extractContentFromResponse(payload, 'application/json', 'json', 'results');
+  assert.ok(extracted.includes('[TRINITY source=uagl_spec.md | tier=HOT | kappa=0.912 | score=0.875]'));
+  assert.ok(extracted.includes('UAGL promotes high-kappa chunks into HOT RAM tier'));
+});
+
+test('Codex CLI Option 1 MCP snippets and presets wire mcp-server.ts and TRINITY tools', () => {
+  const toml = generateCodexCliTomlSnippet();
+  assert.ok(toml.includes('[mcp_servers.semantic_router]'));
+  assert.ok(toml.includes('mcp-server.ts'));
+  assert.ok(toml.includes('TRINITY_URL'));
+
+  const cliCmd = generateCodexMcpAddCommand();
+  assert.ok(cliCmd.includes('codex mcp add semantic_router'));
+  assert.ok(MCP_JSONRPC_PRESETS.some((p) => p.label === 'tools/call · trinity_rag_query'));
+});
+
+test('TRINITY :7700 works both as External Webhook Connector and MCP tools + reloads state on disk edit', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sr-trinity-test-'));
+  const ingestBodies: Array<Record<string, unknown>> = [];
+
+  const mockTrinity = http.createServer((req, res) => {
+    let rawBody = '';
+    req.on('data', (chunk) => {
+      rawBody += chunk;
+    });
+    req.on('end', () => {
+      res.setHeader('Content-Type', 'application/json');
+      if (req.method === 'GET' && req.url === '/health') {
+        res.end(JSON.stringify({ status: 'ok', service: 'Trinity Core RAG', version: '3.0-UAGL', total_chunks: 42 }));
+        return;
+      }
+      const parsed = rawBody ? (JSON.parse(rawBody) as Record<string, unknown>) : {};
+      if (req.method === 'POST' && req.url === '/query') {
+        res.end(
+          JSON.stringify({
+            query: parsed.query_text,
+            k: parsed.k ?? 5,
+            results: [
+              {
+                chunk_id: 'tri-1',
+                content: 'Trinity FAISS vector store bridges UAGL 4-gate resonance filtering.',
+                score: 0.91,
+                tier: 'HOT',
+                kappa: 0.88,
+                source: 'trinity_core.py',
+              },
+            ],
+          })
+        );
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/context') {
+        res.end(JSON.stringify({ context: '[HOT | κ=0.88] Trinity FAISS vector store context block.' }));
+        return;
+      }
+      if (req.method === 'POST' && req.url === '/ingest') {
+        ingestBodies.push(parsed);
+        res.end(JSON.stringify({ chunk_id: 'tri-ingested-1', status: 'ingested' }));
+        return;
+      }
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: 'not found' }));
+    });
+  });
+
+  await new Promise<void>((resolve) => mockTrinity.listen(0, '127.0.0.1', () => resolve()));
+  const addr = mockTrinity.address() as { port: number };
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    const telemetry = new TelemetryCollector();
+    const auth = new ChatGptAuthManager(tmpDir);
+    const service = new UnifiedRouterService(tmpDir, auth, telemetry);
+
+    // 1. Verify MCP tools/list & resources/list include TRINITY entries
+    const toolsRes = await invokeSingleMcpJsonRpc(service, telemetry, {
+      jsonrpc: '2.0',
+      id: 10,
+      method: 'tools/list',
+      params: {},
+    });
+    const tools = (toolsRes.response.result as { tools: Array<{ name: string }> }).tools;
+    assert.ok(tools.some((t) => t.name === 'trinity_rag_query'));
+    assert.ok(tools.some((t) => t.name === 'trinity_rag_context'));
+    assert.ok(tools.some((t) => t.name === 'trinity_rag_ingest'));
+
+    // 2. Call trinity_rag_query, trinity_rag_context, trinity_rag_ingest over MCP stdio
+    const queryRes = await invokeSingleMcpJsonRpc(service, telemetry, {
+      jsonrpc: '2.0',
+      id: 11,
+      method: 'tools/call',
+      params: {
+        name: 'trinity_rag_query',
+        arguments: { queryText: 'UAGL resonance', k: 3, trinityUrl: baseUrl },
+      },
+    });
+    const queryData = (
+      queryRes.response.result as {
+        structuredContent: { data: { results: Array<{ chunk_id: string }> } };
+      }
+    ).structuredContent;
+    assert.equal(queryData.data.results[0].chunk_id, 'tri-1');
+
+    const ctxRes = await invokeSingleMcpJsonRpc(service, telemetry, {
+      jsonrpc: '2.0',
+      id: 12,
+      method: 'tools/call',
+      params: {
+        name: 'trinity_rag_context',
+        arguments: { queryText: 'UAGL resonance', k: 3, trinityUrl: baseUrl },
+      },
+    });
+    const ctxText = (ctxRes.response.result as { content: Array<{ text: string }> }).content[0].text;
+    assert.ok(ctxText.includes('Trinity FAISS vector store context block.'));
+
+    await invokeSingleMcpJsonRpc(service, telemetry, {
+      jsonrpc: '2.0',
+      id: 13,
+      method: 'tools/call',
+      params: {
+        name: 'trinity_rag_ingest',
+        arguments: { content: 'New Codex discovery', kappa: 0.81, trinityUrl: baseUrl },
+      },
+    });
+    assert.equal(ingestBodies[0]?.content, 'New Codex discovery');
+
+    // 3. Also test TRINITY /query wired directly as a POST External Webhook RAG Connector
+    const conn = service.createRagConnector({
+      name: 'TRINITY Test Webhook',
+      url: `${baseUrl}/query`,
+      method: 'POST',
+      parserMode: 'json',
+      jsonPath: 'results',
+      requestBody: JSON.stringify({ query_text: 'UAGL', k: 2 }),
+    });
+    const synced = await service.syncRagConnector(conn.id);
+    assert.equal(synced.chunkCount, 1);
+    const chunks = service.getRagChunks(conn.id);
+    assert.ok(chunks[0].text.includes('tier=HOT'));
+
+    const snap = telemetry.getSnapshot();
+    const ragEdge = snap.edges.find((e) => e.id === 'router->rag_connector');
+    assert.ok((ragEdge?.hitCount ?? 0) >= 4);
+
+    // 4. Verify external disk edits reload cleanly via reloadStateIfModified()
+    const statePath = path.join(tmpDir, 'data', 'router-state.json');
+    const currentRaw = JSON.parse(fs.readFileSync(statePath, 'utf-8')) as {
+      config: { defaultThreshold: number };
+    };
+    currentRaw.config.defaultThreshold = 0.49;
+    const futureMs = Date.now() + 2000;
+    fs.writeFileSync(statePath, JSON.stringify(currentRaw, null, 2), 'utf-8');
+    fs.utimesSync(statePath, futureMs / 1000, futureMs / 1000);
+    assert.equal(service.getConfig().defaultThreshold, 0.49);
+  } finally {
+    await new Promise<void>((resolve) => mockTrinity.close(() => resolve()));
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 

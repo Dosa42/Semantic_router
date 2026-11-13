@@ -121,10 +121,13 @@ export function generateMcpClientConfigSnippet(): string {
   return JSON.stringify(
     {
       mcpServers: {
-        'semantic-router-rag': {
-          command: 'npm',
-          args: ['run', 'mcp', '--silent'],
+        semantic_router_rag: {
+          command: './node_modules/.bin/tsx',
+          args: ['mcp-server.ts'],
           cwd: '/path/to/Semantic_router',
+          env: {
+            TRINITY_URL: 'http://127.0.0.1:7700',
+          },
           transport: 'stdio',
         },
       },
@@ -132,6 +135,52 @@ export function generateMcpClientConfigSnippet(): string {
     null,
     2
   );
+}
+
+export function generateCodexCliTomlSnippet(): string {
+  return `# ~/.codex/config.toml — Option 1: MCP stdio server (Default for Codex CLI)
+# Auto-bridges to http://127.0.0.1:3000/api/mcp/stdio when the Studio server is running
+# so Telemetry SVG edges glow live, and falls back to standalone local state when offline.
+
+[mcp_servers.semantic_router]
+command = "./node_modules/.bin/tsx"
+args = ["mcp-server.ts"]
+cwd = "/path/to/Semantic_router"
+
+[mcp_servers.semantic_router.env]
+TRINITY_URL = "http://127.0.0.1:7700"
+# Uncomment to force isolated local mode even when :3000 is running:
+# SEMANTIC_ROUTER_MODE = "direct"`;
+}
+
+export function generateCodexMcpAddCommand(): string {
+  return `codex mcp add semantic_router --env TRINITY_URL=http://127.0.0.1:7700 -- ./node_modules/.bin/tsx /path/to/Semantic_router/mcp-server.ts`;
+}
+
+export function generateCodexOption2HttpSnippet(config: RouterConfig): string {
+  return `# Option 2: Direct HTTP REST + TRINITY :7700 Bridge (used via shell / curl or AGENTS.md)
+# 1) Route a prompt via Semantic Router (:3000) with hybrid ${config.mode} + RAG:
+curl -s -X POST http://127.0.0.1:3000/api/route \\
+  -H "Content-Type: application/json" \\
+  -d '{"query":"Check UAGL tier distribution in TRINITY","useRag":true,"executeProvider":false}'
+
+# 2) Query external TRINITY Core (:7700 /query) through Router Telemetry (:3000/api/trinity/query):
+curl -s -X POST http://127.0.0.1:3000/api/trinity/query \\
+  -H "Content-Type: application/json" \\
+  -d '{"queryText":"Semantic Router architecture","k":5,"minKappa":0.0}'
+
+# 3) Fetch packed TRINITY context (:7700 /context -> :3000/api/trinity/context):
+curl -s -X POST http://127.0.0.1:3000/api/trinity/context \\
+  -H "Content-Type: application/json" \\
+  -d '{"queryText":"UAGL tier transitions","k":5}'`;
+}
+
+export function generateCodexAgentsSnippet(): string {
+  return `# AGENTS.md (project instruction for Codex CLI)
+Before answering architecture, SQL, billing, or RAG questions:
+1. Call MCP tool \`semantic_router.route_prompt\` to classify intent and load bound RAG context.
+2. Call \`semantic_router.trinity_rag_query\` or \`semantic_router.trinity_rag_context\` to query TRINITY (:7700).
+3. If HTTP server :3000 is down, \`mcp-server.ts\` executes locally against \`data/router-state.json\`.`;
 }
 
 export const MCP_JSONRPC_PRESETS: Array<{
@@ -149,13 +198,13 @@ export const MCP_JSONRPC_PRESETS: Array<{
       params: {
         protocolVersion: '2024-11-05',
         capabilities: {},
-        clientInfo: { name: 'studio-bridge', version: '1.0.0' },
+        clientInfo: { name: 'codex-cli-bridge', version: '1.0.0' },
       },
     },
   },
   {
     label: 'tools/list',
-    description: 'Discover available Semantic Router & RAG MCP tools',
+    description: 'Discover Semantic Router, RAG, and TRINITY :7700 MCP tools',
     payload: {
       jsonrpc: '2.0',
       id: 2,
@@ -197,11 +246,44 @@ export const MCP_JSONRPC_PRESETS: Array<{
     },
   },
   {
-    label: 'resources/list',
-    description: 'List exposed router:// and rag:// MCP resources',
+    label: 'tools/call · trinity_rag_query',
+    description: 'Invoke TRINITY :7700 /query wrapped as an MCP tool',
     payload: {
       jsonrpc: '2.0',
       id: 5,
+      method: 'tools/call',
+      params: {
+        name: 'trinity_rag_query',
+        arguments: {
+          queryText: 'Unified Semantic Router and UAGL tiering',
+          k: 5,
+          minKappa: 0.0,
+        },
+      },
+    },
+  },
+  {
+    label: 'tools/call · trinity_rag_context',
+    description: 'Invoke TRINITY :7700 /context wrapped as an MCP tool',
+    payload: {
+      jsonrpc: '2.0',
+      id: 6,
+      method: 'tools/call',
+      params: {
+        name: 'trinity_rag_context',
+        arguments: {
+          queryText: 'Semantic Router architecture overview',
+          k: 5,
+        },
+      },
+    },
+  },
+  {
+    label: 'resources/list',
+    description: 'List exposed router://, rag://, and trinity:// MCP resources',
+    payload: {
+      jsonrpc: '2.0',
+      id: 7,
       method: 'resources/list',
       params: {},
     },

@@ -342,6 +342,7 @@ export default function App() {
     method: 'GET' | 'POST';
     parserMode: RagParserMode;
     jsonPath?: string;
+    requestBody?: string;
   }) => {
     const res = await fetch('/api/rag/connectors', {
       method: 'POST',

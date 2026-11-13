@@ -8,6 +8,12 @@ import {
 } from './providers.ts';
 import { fetchAndChunkConnector, scoreRagChunks } from './ragEngine.ts';
 import {
+  checkTrinityHealth,
+  fetchTrinityContext,
+  ingestTrinityChunk,
+  queryTrinityRag,
+} from './trinityBridge.ts';
+import {
   createLocalVectorLookup,
   evaluateDataset,
   extractDynamicParametersLocal,
@@ -93,6 +99,7 @@ export class UnifiedRouterService {
   private lastRagError: string | null = null;
   private mcpCallCount = 0;
   private readonly mcpLogs: McpStdioLogEntry[] = [];
+  private stateFileMtimeMs = 0;
 
   constructor(
     rootDir: string,
@@ -171,9 +178,30 @@ export class UnifiedRouterService {
         fs.mkdirSync(this.dataDir, { recursive: true });
       }
       fs.writeFileSync(this.stateFile, JSON.stringify(this.state, null, 2), 'utf-8');
+      this.stateFileMtimeMs = fs.statSync(this.stateFile).mtimeMs;
     } catch (err) {
       console.error('Failed to persist router state:', err);
     }
+  }
+
+  reloadStateIfModified(): boolean {
+    try {
+      if (!fs.existsSync(this.stateFile)) return false;
+      const mtimeMs = fs.statSync(this.stateFile).mtimeMs;
+      if (this.stateFileMtimeMs === 0) {
+        this.stateFileMtimeMs = mtimeMs;
+        return false;
+      }
+      if (mtimeMs > this.stateFileMtimeMs) {
+        this.state = this.loadState();
+        this.stateFileMtimeMs = mtimeMs;
+        this.e5EmbeddingCache.clear();
+        return true;
+      }
+    } catch {
+      // Ignore stat/read race gracefully
+    }
+    return false;
   }
 
   private loadLibraryKnowledge(): LibraryKnowledgeState {
@@ -278,6 +306,7 @@ export class UnifiedRouterService {
   }
 
   getWorkspaceData() {
+    this.reloadStateIfModified();
     return {
       routes: this.state.routes,
       evalCases: this.state.evalCases,
@@ -289,22 +318,27 @@ export class UnifiedRouterService {
   }
 
   getRoutes(): RouteDefinition[] {
+    this.reloadStateIfModified();
     return this.state.routes;
   }
 
   getConfig(): RouterConfig {
+    this.reloadStateIfModified();
     return this.state.config;
   }
 
   getInstructions(): SystemInstructionsConfig {
+    this.reloadStateIfModified();
     return this.state.instructions;
   }
 
   getRagConnectors(): RagConnector[] {
+    this.reloadStateIfModified();
     return this.state.ragConnectors;
   }
 
   getRagChunks(connectorId?: string): RagChunk[] {
+    this.reloadStateIfModified();
     if (!connectorId) return this.state.ragChunks;
     return this.state.ragChunks.filter((c) => c.connectorId === connectorId);
   }
@@ -733,6 +767,7 @@ export class UnifiedRouterService {
     routeId?: string | null;
     topK?: number;
   }): Promise<RagQueryResult> {
+    this.reloadStateIfModified();
     const startNs = process.hrtime.bigint();
     const query = opts.query.trim();
     if (!query) {
@@ -787,6 +822,7 @@ export class UnifiedRouterService {
     useRag?: boolean;
     transport?: 'http' | 'mcp';
   }): Promise<RouteDecisionResult> {
+    this.reloadStateIfModified();
     const query = opts.query.trim();
     if (!query) {
       throw new Error('Prompt query is required.');
@@ -911,6 +947,7 @@ export class UnifiedRouterService {
   }
 
   async evaluate(): Promise<EvalReport> {
+    this.reloadStateIfModified();
     this.isEvaluatingOrFitting = true;
     this.telemetry.notify();
     const endRouter = this.telemetry.beginSpan('express->router');
@@ -945,6 +982,7 @@ export class UnifiedRouterService {
   }
 
   async fit(): Promise<FitReport> {
+    this.reloadStateIfModified();
     this.isEvaluatingOrFitting = true;
     this.telemetry.notify();
     const endRouter = this.telemetry.beginSpan('express->router');
@@ -1276,6 +1314,83 @@ export class UnifiedRouterService {
     if (this.state.evalCases.length === before) return false;
     this.saveState();
     return true;
+  }
+
+  async getTrinityHealth(trinityUrl?: string | null) {
+    const endRag = this.telemetry.beginSpan('router->rag_connector');
+    try {
+      const result = await checkTrinityHealth(trinityUrl);
+      this.lastRagLatencyMs = result.latencyMs;
+      this.lastRagError = null;
+      endRag('ok');
+      return result;
+    } catch (err) {
+      this.lastRagError = (err as Error).message;
+      endRag('error');
+      throw err;
+    }
+  }
+
+  async trinityQuery(opts: {
+    queryText: string;
+    k?: number;
+    tierFilter?: string | null;
+    minKappa?: number;
+    trinityUrl?: string | null;
+  }) {
+    const endRag = this.telemetry.beginSpan('router->rag_connector');
+    try {
+      const result = await queryTrinityRag(opts);
+      this.lastRagLatencyMs = result.latencyMs;
+      this.lastRagError = null;
+      endRag('ok');
+      return result;
+    } catch (err) {
+      this.lastRagError = (err as Error).message;
+      endRag('error');
+      throw err;
+    }
+  }
+
+  async trinityContext(opts: {
+    queryText: string;
+    k?: number;
+    trinityUrl?: string | null;
+  }) {
+    const endRag = this.telemetry.beginSpan('router->rag_connector');
+    try {
+      const result = await fetchTrinityContext(opts);
+      this.lastRagLatencyMs = result.latencyMs;
+      this.lastRagError = null;
+      endRag('ok');
+      return result;
+    } catch (err) {
+      this.lastRagError = (err as Error).message;
+      endRag('error');
+      throw err;
+    }
+  }
+
+  async trinityIngest(opts: {
+    content: string;
+    source?: string;
+    sessionId?: string;
+    kappa?: number;
+    metadata?: Record<string, unknown>;
+    trinityUrl?: string | null;
+  }) {
+    const endRag = this.telemetry.beginSpan('router->rag_connector');
+    try {
+      const result = await ingestTrinityChunk(opts);
+      this.lastRagLatencyMs = result.latencyMs;
+      this.lastRagError = null;
+      endRag('ok');
+      return result;
+    } catch (err) {
+      this.lastRagError = (err as Error).message;
+      endRag('error');
+      throw err;
+    }
   }
 
   resetWorkspace() {

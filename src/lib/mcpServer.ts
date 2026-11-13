@@ -89,6 +89,68 @@ export const MCP_TOOL_DEFINITIONS = [
       properties: {},
     },
   },
+  {
+    name: 'trinity_rag_query',
+    description:
+      'Query external TRINITY Core RAG (:7700 POST /query) for ranked FAISS + UAGL tier/kappa chunks.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        queryText: { type: 'string', description: 'Semantic query text for TRINITY /query' },
+        k: { type: 'number', description: 'Top-K chunks to return (default 5)' },
+        tierFilter: {
+          type: 'string',
+          description: 'Optional UAGL memory tier filter (e.g., HOT, WARM, COLD)',
+        },
+        minKappa: {
+          type: 'number',
+          description: 'Minimum resonance kappa score filter (default 0.0)',
+        },
+        trinityUrl: {
+          type: 'string',
+          description: 'Optional override base URL (default http://127.0.0.1:7700)',
+        },
+      },
+      required: ['queryText'],
+    },
+  },
+  {
+    name: 'trinity_rag_context',
+    description:
+      'Fetch pre-formatted context string directly from TRINITY Core RAG (:7700 POST /context).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        queryText: { type: 'string', description: 'Query text for TRINITY /context' },
+        k: { type: 'number', description: 'Top-K chunks to pack into context (default 5)' },
+        trinityUrl: {
+          type: 'string',
+          description: 'Optional override base URL (default http://127.0.0.1:7700)',
+        },
+      },
+      required: ['queryText'],
+    },
+  },
+  {
+    name: 'trinity_rag_ingest',
+    description:
+      'Ingest a knowledge chunk into TRINITY Core RAG (:7700 POST /ingest) with optional kappa and metadata.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: 'Text content to ingest into TRINITY FAISS index' },
+        source: { type: 'string', description: 'Logical source tag' },
+        sessionId: { type: 'string', description: 'Session identifier' },
+        kappa: { type: 'number', description: 'Initial UAGL kappa score (0..1)' },
+        metadata: { type: 'object', description: 'Optional JSON metadata object' },
+        trinityUrl: {
+          type: 'string',
+          description: 'Optional override base URL (default http://127.0.0.1:7700)',
+        },
+      },
+      required: ['content'],
+    },
+  },
 ];
 
 export class McpStdioServer {
@@ -279,6 +341,53 @@ export class McpStdioServer {
         };
       }
 
+      if (toolName === 'trinity_rag_query') {
+        const queryText = String(args.queryText ?? args.query ?? '').trim();
+        const result = await this.opts.service.trinityQuery({
+          queryText,
+          k: typeof args.k === 'number' ? args.k : undefined,
+          tierFilter: typeof args.tierFilter === 'string' ? args.tierFilter : null,
+          minKappa: typeof args.minKappa === 'number' ? args.minKappa : undefined,
+          trinityUrl: typeof args.trinityUrl === 'string' ? args.trinityUrl : undefined,
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+        };
+      }
+
+      if (toolName === 'trinity_rag_context') {
+        const queryText = String(args.queryText ?? args.query ?? '').trim();
+        const result = await this.opts.service.trinityContext({
+          queryText,
+          k: typeof args.k === 'number' ? args.k : undefined,
+          trinityUrl: typeof args.trinityUrl === 'string' ? args.trinityUrl : undefined,
+        });
+        return {
+          content: [{ type: 'text', text: result.data.context || JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+        };
+      }
+
+      if (toolName === 'trinity_rag_ingest') {
+        const content = String(args.content ?? '').trim();
+        const result = await this.opts.service.trinityIngest({
+          content,
+          source: typeof args.source === 'string' ? args.source : undefined,
+          sessionId: typeof args.sessionId === 'string' ? args.sessionId : undefined,
+          kappa: typeof args.kappa === 'number' ? args.kappa : undefined,
+          metadata:
+            args.metadata && typeof args.metadata === 'object'
+              ? (args.metadata as Record<string, unknown>)
+              : undefined,
+          trinityUrl: typeof args.trinityUrl === 'string' ? args.trinityUrl : undefined,
+        });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+        };
+      }
+
       throw new Error(`Unknown MCP tool: ${toolName}`);
     }
 
@@ -305,6 +414,11 @@ export class McpStdioServer {
             name: 'Indexed RAG Knowledge Chunks',
             mimeType: 'application/json',
           },
+          {
+            uri: 'trinity://health',
+            name: 'TRINITY :7700 Core Health & UAGL Stats',
+            mimeType: 'application/json',
+          },
         ],
       };
     }
@@ -316,6 +430,7 @@ export class McpStdioServer {
       else if (uri === 'router://instructions') data = this.opts.service.getInstructions();
       else if (uri === 'rag://connectors') data = this.opts.service.getRagConnectors();
       else if (uri === 'rag://chunks') data = this.opts.service.getRagChunks();
+      else if (uri === 'trinity://health') data = await this.opts.service.getTrinityHealth();
       else throw new Error(`Unknown resource URI: ${uri}`);
 
       return {
@@ -395,8 +510,17 @@ export async function invokeSingleMcpJsonRpc(
   });
   server.start();
 
-  const frameStr =
-    typeof rawPayload === 'string' ? rawPayload.trim() : JSON.stringify(rawPayload);
+  let frameStr: string;
+  if (typeof rawPayload === 'string') {
+    const trimmed = rawPayload.trim();
+    try {
+      frameStr = JSON.stringify(JSON.parse(trimmed));
+    } catch {
+      frameStr = trimmed.replace(/\r?\n/g, ' ');
+    }
+  } else {
+    frameStr = JSON.stringify(rawPayload);
+  }
 
   const responsePromise = new Promise<string>((resolve, reject) => {
     let buffer = '';

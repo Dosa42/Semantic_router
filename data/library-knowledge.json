@@ -1,0 +1,83 @@
+{
+  "version": "1.0.0",
+  "updatedAt": "2026-11-13T11:10:00.000Z",
+  "notes": "Comparative architectural library contrasting Semantic Router Studio (TypeScript/Node ONNX e5-small-v2 + MCP stdio + External RAG Webhooks + ChatGPT OAuth PKCE) with Torrent-RAG-UAGL (Python asyncio TRINITY FAISS + SQLite 4-tier SDCK + BitTorrent 256KiB P2P swarm + UAGL 3.0 R4 ForceVector/TESSA governance). Use this library as a blueprint for bridging TRINITY FastAPI (:7700) as an External RAG Connector or MCP tool target.",
+  "blueprints": [
+    {
+      "id": "semantic-router-studio",
+      "title": "Semantic Router Studio",
+      "stackLabel": "TypeScript · Node.js 22 · React 19 · Express :3000 + MCP stdio",
+      "summary": "Single-node unified routing & instruction workbench blending Xenova/e5-small-v2 ONNX 384d + BM25, MCP JSON-RPC stdio, external webhook RAG connectors, and OpenAI ChatGPT OAuth2 PKCE.",
+      "portsAndProtocols": [
+        "0.0.0.0:3000 HTTP/SSE",
+        "stdin/stdout JSON-RPC 2.0",
+        "127.0.0.1:1455 OAuth PKCE",
+        ":443 OpenAI & RAG HTTPS"
+      ],
+      "mermaidCode": "flowchart TB\n  classDef ingress fill:#f8fafc,stroke:#334155,stroke-width:1.5px,color:#0f172a\n  classDef shared fill:#eff6ff,stroke:#1d4ed8,stroke-width:1.8px,color:#0f172a\n  classDef rag fill:#ecfdf5,stroke:#047857,stroke-width:1.6px,color:#0f172a\n  classDef gov fill:#fffbeb,stroke:#b45309,stroke-width:1.6px,color:#0f172a\n\n  subgraph INGRESS[\"1. Dual Ingress & Framing (Node.js 22 / TypeScript)\"]\n    UI[\"Client Browser (App.tsx)<br/>HTTP + EventSource SSE\"]:::ingress\n    EXP[\"Express Gateway (server.ts)<br/>0.0.0.0:3000 · /api/route · /api/rag/*\"]:::ingress\n    MCP_CLI[\"MCP Client / SdkView Bridge<br/>mcp-server.ts · PassThrough stdio\"]:::ingress\n    MCP_SRV[\"McpStdioServer (mcpServer.ts)<br/>JSON-RPC 2.0 · tools/call · resources/read\"]:::ingress\n  end\n\n  subgraph SHARED[\"2. Shared Semantic Core & EmbeddingsBridge\"]\n    URS[\"UnifiedRouterService (routerService.ts)<br/>Single Orchestrator · hrtime Spans\"]:::shared\n    EMB_INST[\"formatEmbeddingText (instructions.ts)<br/>query:/passage: · taskInstruction · routeOverride\"]:::gov\n    BRIDGE[\"EmbeddingsBridge (buildVectorLookup)<br/>e5EmbeddingCache Map + Batch 24\"]:::shared\n    ONNX[\"Xenova/e5-small-v2 (ONNX q8 384d)<br/>Fallback: computeLocalDenseVector 256d\"]:::shared\n    SCORE[\"scoreRoutes (routerEngine.ts)<br/>alpha*Dense + (1-alpha)*BM25 · max/mean/top_k\"]:::shared\n  end\n\n  subgraph RAG_STORE[\"3. Unified RAG Connectors & Persistence\"]\n    HOOK[\"fetchAndChunkConnector (ragEngine.ts)<br/>External HTTP/HTTPS Webhook & URL Fetch\"]:::rag\n    PARSE[\"extractContentFromResponse + chunkText<br/>JSONPath / HTML Strip / Overlap Chunks\"]:::rag\n    RAG_SC[\"scoreRagChunks (Hybrid Retrieval)<br/>routeId Scope + Top-K Dense/Sparse\"]:::rag\n    STATE[\"router-state.json + TelemetryCollector<br/>Routes · Chunks · 8 Live Span Edges\"]:::rag\n  end\n\n  subgraph EXEC_AUTH[\"4. Provider Dispatch, Instructions & OAuth PKCE\"]\n    PARAMS[\"extractDynamicParameters<br/>ChatGPT JSON or Local Regex\"]:::gov\n    GPT_INST[\"resolveChatGptSystemPrompt<br/>Per-Route Override + Citations [1..K]\"]:::gov\n    OAUTH[\"ChatGptAuthManager (chatgptAuth.ts)<br/>127.0.0.1:1455 PKCE + chatgpt-auth.json\"]:::gov\n    TARGET[\"Target Execution (:443 / Local)<br/>api.openai.com/v1/responses | Tools | Guardrails\"]:::gov\n  end\n\n  UI -->|\"HTTP/SSE :3000 (browser to express)\"| EXP\n  EXP -->|\"transport: http (express to router)\"| URS\n  MCP_CLI -->|\"stdin / stdout lines\"| MCP_SRV\n  MCP_SRV -->|\"transport: mcp (mcp to router)\"| URS\n\n  URS -->|\"apply template\"| EMB_INST\n  EMB_INST -->|\"router to bridge\"| BRIDGE\n  BRIDGE -->|\"bridge to embedding\"| ONNX\n  ONNX -->|\"384d / 256d vectors\"| SCORE\n\n  URS -->|\"router to rag_connector :443\"| HOOK\n  HOOK --> PARSE\n  PARSE --> STATE\n  SCORE -->|\"matchedRoute\"| RAG_SC\n  STATE --> RAG_SC\n\n  URS -->|\"dynamic route\"| PARAMS\n  RAG_SC -->|\"top-K chunks\"| GPT_INST\n  PARAMS --> GPT_INST\n  GPT_INST -->|\"router to chatgpt :443\"| TARGET\n  OAUTH -->|\"chatgpt to loopback :1455\"| TARGET\n  URS -->|\"live span metrics\"| STATE"
+    },
+    {
+      "id": "torrent-rag-uagl",
+      "title": "Torrent-RAG-UAGL (TRINITY + UAGL 3.0)",
+      "stackLabel": "Python asyncio · FastAPI :7700 · Tracker :6969 · UAG3 TCP :9000",
+      "summary": "Distributed P2P RAG + symbolic safety calculus combining FAISS IndexFlatIP (MiniLM 384d), SQLite 4-tier SDCK lifecycle, BitTorrent 256 KiB piece swarming, and UAGL R4 ForceVector + TESSA gating.",
+      "portsAndProtocols": [
+        ":7700 FastAPI RAG",
+        ":6969 Tracker HTTP",
+        ":9000 UAG3 Binary TCP",
+        "TCP P2P + Kademlia DHT"
+      ],
+      "mermaidCode": "flowchart TB\n  classDef ingress fill:#f8fafc,stroke:#334155,stroke-width:1.5px,color:#0f172a\n  classDef shared fill:#eff6ff,stroke:#1d4ed8,stroke-width:1.8px,color:#0f172a\n  classDef rag fill:#ecfdf5,stroke:#047857,stroke-width:1.6px,color:#0f172a\n  classDef gov fill:#fffbeb,stroke:#b45309,stroke-width:1.6px,color:#0f172a\n\n  subgraph INGRESS[\"1. Multi-Port Ingress & P2P Swarm (Python asyncio)\"]\n    direction TB\n    TRK[\"TrinityTrackerServer (:6969 HTTP)<br/>/announce · /scrape (5m TTL)\"]:::ingress\n    P2P[\"P2PWireProtocol + PeerManager<br/>4B Len + zlib(JSON) · 22 Opcodes + DHT\"]:::ingress\n    API[\"Trinity Core FastAPI (:7700)<br/>/ingest · /query · /context\"]:::ingress\n    UAG_SRV[\"UAGLBroker AI2AI Server (:9000 TCP)<br/>Wire Magic 'UAG3' + Ligature\"]:::ingress\n    TRK -->|\"peer lists :6969\"| P2P\n  end\n\n  subgraph SHARED[\"2. Shared Semantic Core & Vector Engine\"]\n    direction TB\n    CORE[\"TrinityRAGServer (trinity_core.py)<br/>asyncio.Lock + Hot LRU Cache (500)\"]:::shared\n    UAG_RT[\"execute_uagl (uagl_runtime.py)<br/>Glyph Parse · Density Mult · Chain\"]:::gov\n    SFE[\"SemanticForceEngine<br/>all-MiniLM-L6-v2 (384d) + SHA-512\"]:::shared\n    FAISS[\"FAISSIndex (IndexFlatIP 384d)<br/>Cosine Sim · Numpy Linear Fallback\"]:::shared\n    RANK[\"Hybrid Force Ranker<br/>0.7*FAISS + 0.3*kappa · min_kappa\"]:::shared\n  end\n\n  subgraph RAG_STORE[\"3. SDCK Tiered Lifecycle, SQLite & Torrent Pieces\"]\n    direction TB\n    SDCK[\"SDCKCanon (classify)<br/>len + access + source_wt + 0.3*kappa\"]:::rag\n    TIERS[\"StorageManager (trinity_storage.py)<br/>HOT SSD -> WARM -> COLD zlib -> FROZEN\"]:::rag\n    PIECES[\"TorrentPieceCache (256 KiB)<br/>Bitfield + SHA-1 Pieces\"]:::rag\n    SQLITE[\"TrinityMetadataStore (SQLite)<br/>trinity_metadata.db · chunks + query_log\"]:::rag\n  end\n\n  subgraph EXEC_AUTH[\"4. UAGL R4 Manifold, TESSA & Security\"]\n    direction TB\n    FV[\"ForceVector R4 (g1, g2, g3, g4)<br/>V-Path V1..V10 + V3/V8 Bifurcation\"]:::gov\n    TESSA[\"tessa_classify -> Permission<br/>ALLOW | MONITOR (kappa under 0.5) | ISOLATE (under 0.3)\"]:::gov\n    GSIG[\"guardian_sign (BLAKE2b-8)<br/>Sig 'G3·HEX' + 7-Layer AST Obfuscator\"]:::gov\n    CTX_OUT[\"get_context_for_llm -> External LLM<br/>[1..K] source + kappa + tier\"]:::gov\n  end\n\n  API -->|\"REST JSON :7700\"| CORE\n  P2P -->|\"KNOWLEDGE_DATA / PIECE 0x0A\"| CORE\n  UAG_SRV -->|\"session.advance()\"| UAG_RT\n\n  UAG_RT -->|\"final_fv + kappa\"| CORE\n  CORE -->|\"embed(text)\"| SFE\n  SFE -->|\"float32 384d\"| FAISS\n  FAISS -->|\"k*3 candidates\"| RANK\n\n  CORE -->|\"classify tier\"| SDCK\n  SDCK --> TIERS\n  TIERS -->|\"tier webhook :7700\"| API\n  CORE --> SQLITE\n  P2P <-->|\"bitfield / pieces\"| PIECES\n\n  UAG_RT --> FV\n  FV --> TESSA\n  TESSA -->|\"kappa gate\"| RANK\n  UAG_SRV --> GSIG\n  RANK --> CTX_OUT"
+    }
+  ],
+  "comparisonMatrix": [
+    {
+      "dimension": "Runtime & Process Model",
+      "semanticRouterStudio": "TypeScript / Node.js 22 + React 19 Vite SPA + Express (:3000) + standalone MCP stdio CLI.",
+      "torrentRagUagl": "Python 3 asyncio microservices: FastAPI RAG (:7700), BitTorrent Tracker (:6969), UAG3 TCP Broker (:9000), P2P Wire TCP.",
+      "sharedPattern": "Unified central orchestrator decoupling transport ingress from embedding & retrieval logic."
+    },
+    {
+      "dimension": "Ingress & Transport Framing",
+      "semanticRouterStudio": "HTTP REST + EventSource SSE (:3000) + newline JSON-RPC 2.0 stdio (stdin/stdout) with PassThrough UI bridge.",
+      "torrentRagUagl": "FastAPI REST (:7700) + HTTP Tracker (:6969) + zlib length-prefixed P2P TCP + 74B+ UAG3 binary frames (:9000).",
+      "sharedPattern": "Dual-ingress philosophy: human/dashboard HTTP API alongside machine-to-machine agent wire transport."
+    },
+    {
+      "dimension": "Dense Embeddings & Scoring",
+      "semanticRouterStudio": "Xenova/e5-small-v2 (ONNX 384d, query:/passage:) + local 256d projection + BM25 lexical alpha blending.",
+      "torrentRagUagl": "SentenceTransformer all-MiniLM-L6-v2 (384d) + SHA-512 hash fallback + FAISS IndexFlatIP + kappa score blending (0.7/0.3).",
+      "sharedPattern": "384-dimensional normalized float32 dense vectors with deterministic zero-dependency hash/projection fallback."
+    },
+    {
+      "dimension": "Prompt / Control Governance",
+      "semanticRouterStudio": "Dual System Instructions (Embedding templates + ChatGPT system/extraction prompts) + per-route overrides + safety guardrail routes.",
+      "torrentRagUagl": "UAGL 3.0 R4 ForceVector (g1..g4) stateful session chaining, V1..V10 manifold tracking, and TESSA ALLOW/MONITOR/ISOLATE gates.",
+      "sharedPattern": "Pre-execution semantic policy layer shaping and gating inference before final target execution."
+    },
+    {
+      "dimension": "RAG Ingestion & Knowledge Sync",
+      "semanticRouterStudio": "Pull-based external HTTP/HTTPS Webhook & URL fetchers (JSONPath, HTML-to-text, overlap chunking) scoped by route bindings.",
+      "torrentRagUagl": "Push POST /ingest + BitTorrent-style 256 KiB PieceCache bitfields + Kademlia DHT & P2P peer gossip.",
+      "sharedPattern": "Chunked text retrieval returning scored top-K citations ([1..K]) formatted directly for LLM prompt grounding."
+    },
+    {
+      "dimension": "Storage & Persistence",
+      "semanticRouterStudio": "JSON state snapshot (router-state.json) + in-memory E5 vector Map cache + persistent Library Knowledge store.",
+      "torrentRagUagl": "SQLite (trinity_metadata.db) + FAISS vector index + 4-tier lifecycle (HOT/WARM/COLD zlib/FROZEN) with hourly consolidation.",
+      "sharedPattern": "Hot in-memory caching layered in front of durable disk metadata and vector blobs."
+    },
+    {
+      "dimension": "Security, Auth & Integrity",
+      "semanticRouterStudio": "OpenAI OAuth2 + PKCE S256 (127.0.0.1:1455 loopback / device flow) + telemetry secret redaction.",
+      "torrentRagUagl": "BLAKE2b guardian_sign (\"G3·HEX\") per wire packet + 7-layer AST + Göktürk symbol UAGLObfuscator + Unix-style Permission masks.",
+      "sharedPattern": "Cryptographic verification bound to session/sequence identity before privileged model/storage actions."
+    },
+    {
+      "dimension": "Observability & Telemetry",
+      "semanticRouterStudio": "Millisecond hrtime.bigint() active/decay spans streamed via SSE to dynamic SVG node/port topology.",
+      "torrentRagUagl": "SQLite query_log + UAGL ASCII kbar/trace execution dumps + PEER_EXEC session broadcasts + Tracker /scrape stats.",
+      "sharedPattern": "End-to-end execution trace logging capturing latency, confidence/kappa scores, and transport status."
+    }
+  ]
+}

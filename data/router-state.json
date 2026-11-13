@@ -250,12 +250,49 @@
       "chunkSize": 380,
       "chunkOverlap": 40,
       "enabled": true,
-      "lastSyncedAt": null,
-      "lastStatus": "idle",
-      "lastLatencyMs": null,
+      "lastSyncedAt": "2026-11-13T19:25:22.724Z",
+      "lastStatus": "ok",
+      "lastLatencyMs": 24.9,
       "lastError": null,
-      "chunkCount": 0
+      "chunkCount": 4
     }
   ],
-  "ragChunks": []
+  "ragChunks": [
+    {
+      "id": "rag-conn-router-docs:chunk-0",
+      "connectorId": "rag-conn-router-docs",
+      "connectorName": "Semantic Router Architecture Feed",
+      "sourceUrl": "http://127.0.0.1:3000/api/rag/demo-webhook",
+      "text": "Semantic Router Studio blends dense bi-encoder cosine similarity (intfloat/e5-small-v2 384-dim) with sparse BM25/IDF token similarity using configurable alpha weighting and max/mean/top_k_mean aggregation.\n# Aurelio Semantic Router Hybrid Scoring",
+      "chunkIndex": 0,
+      "fetchedAt": "2026-11-13T19:25:22.724Z"
+    },
+    {
+      "id": "rag-conn-router-docs:chunk-1",
+      "connectorId": "rag-conn-router-docs",
+      "connectorName": "Semantic Router Architecture Feed",
+      "sourceUrl": "http://127.0.0.1:3000/api/rag/demo-webhook",
+      "text": "# Aurelio Semantic Router Hybrid Scoring\nFor PostgreSQL analytical workloads, composite B-Tree indexes should order high-selectivity equality predicates first, followed by range/window partition columns. Window functions like ROW_NUMBER() and SUM() OVER (PARTITION BY ...) avoid self-joins.\n# SQL Analytics Optimization Best Practices",
+      "chunkIndex": 1,
+      "fetchedAt": "2026-11-13T19:25:22.724Z"
+    },
+    {
+      "id": "rag-conn-router-docs:chunk-2",
+      "connectorId": "rag-conn-router-docs",
+      "connectorName": "Semantic Router Architecture Feed",
+      "sourceUrl": "http://127.0.0.1:3000/api/rag/demo-webhook",
+      "text": "QL Analytics Optimization Best Practices\nThe unified Semantic Router & RAG Server exposes identical route_prompt, rag_retrieve, and sync_rag_connector capabilities over both HTTP (/api/*) and Model Context Protocol (stdin/stdout JSON-RPC 2.0).\n# MCP Stdio & Unified RAG Transport",
+      "chunkIndex": 2,
+      "fetchedAt": "2026-11-13T19:25:22.724Z"
+    },
+    {
+      "id": "rag-conn-router-docs:chunk-3",
+      "connectorId": "rag-conn-router-docs",
+      "connectorName": "Semantic Router Architecture Feed",
+      "sourceUrl": "http://127.0.0.1:3000/api/rag/demo-webhook",
+      "text": ".0).\n# MCP Stdio & Unified RAG Transport\nDuplicate credit card charges referencing order identifiers (ORD-XXXX or INV-XXX) qualify for automated review tickets via process_billing_refund when a valid reason is provided.\n# Billing Refund Policy & Order Validation",
+      "chunkIndex": 3,
+      "fetchedAt": "2026-11-13T19:25:22.724Z"
+    }
+  ]
 }
