@@ -175,6 +175,50 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['outputText'],
     },
   },
+  {
+    name: 'run_redteam_probe',
+    description:
+      'Run an autonomous Red-Team adversarial probe campaign against semantic router guardrails, finding boundary gaps and evasion variants.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        targetRouteNames: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional target guardrail route names (e.g. ["prompt_injection_guard", "politics"])',
+        },
+        strategies: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional attack strategies (semantic_cloaking, metaphorical_framing, cross_language, hypothetical_scaffolding, adversarial_obfuscation, payload_splitting)',
+        },
+        variantsPerStrategy: {
+          type: 'number',
+          description: 'Number of attack variants to generate per strategy (1..10, default 3)',
+        },
+      },
+    },
+  },
+  {
+    name: 'apply_guardrail_patch',
+    description:
+      'Apply synthesized defensive utterances to a semantic router guardrail route to patch evasion gaps identified by red-teaming.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        targetRouteName: {
+          type: 'string',
+          description: 'Target route name to patch (e.g. "prompt_injection_guard")',
+        },
+        suggestedUtterances: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Array of defensive utterances to append',
+        },
+      },
+      required: ['targetRouteName', 'suggestedUtterances'],
+    },
+  },
 ];
 
 export class McpStdioServer {
@@ -426,6 +470,45 @@ export class McpStdioServer {
         const result = await this.opts.service.evaluateProgressOutput(outputText);
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+        };
+      }
+
+      if (toolName === 'run_redteam_probe') {
+        const targetRouteNames = Array.isArray(args.targetRouteNames)
+          ? (args.targetRouteNames as string[])
+          : undefined;
+        const strategies = Array.isArray(args.strategies)
+          ? (args.strategies as any[])
+          : undefined;
+        const variantsPerStrategy =
+          typeof args.variantsPerStrategy === 'number' ? args.variantsPerStrategy : undefined;
+
+        const report = await this.opts.service.runRedTeamCampaign({
+          targetRouteNames,
+          strategies,
+          variantsPerStrategy,
+        });
+
+        return {
+          content: [{ type: 'text', text: report.executionLogs.join('\n') }],
+          structuredContent: report,
+        };
+      }
+
+      if (toolName === 'apply_guardrail_patch') {
+        const targetRouteName = String(args.targetRouteName ?? '').trim();
+        const suggestedUtterances = Array.isArray(args.suggestedUtterances)
+          ? (args.suggestedUtterances as string[])
+          : [];
+        const result = this.opts.service.applyGuardrailPatch(targetRouteName, suggestedUtterances);
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `Successfully added ${result.addedCount} defensive utterance(s) to route ${targetRouteName}. Total utterances now: ${result.updatedRoute.utterances.length}.`,
+            },
+          ],
           structuredContent: result,
         };
       }

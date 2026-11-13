@@ -8,6 +8,7 @@ import {
   Menu,
   Plus,
   RotateCcw,
+  ShieldAlert,
   SlidersHorizontal,
   Terminal,
   UserCheck,
@@ -20,6 +21,7 @@ import { InstructionsView } from './components/InstructionsView';
 import { PlaygroundView } from './components/PlaygroundView';
 import { ProgressDashboard } from './components/ProgressDashboard';
 import { ProvidersView } from './components/ProvidersView';
+import { RedTeamView } from './components/RedTeamView';
 import { RouteEditorModal } from './components/RouteEditorModal';
 import { RoutesView } from './components/RoutesView';
 import { SdkView } from './components/SdkView';
@@ -63,6 +65,7 @@ type NavTab =
   | 'instructions'
   | 'progress'
   | 'evaluation'
+  | 'redteam'
   | 'providers'
   | 'sdk';
 
@@ -72,6 +75,7 @@ const TAB_LABELS: Record<NavTab, string> = {
   instructions: 'System Instructions',
   progress: 'Progress',
   evaluation: 'Evaluation & Fit',
+  redteam: 'Red-Team Bot',
   providers: 'Providers & E5',
   sdk: 'SDK & API',
 };
@@ -640,12 +644,35 @@ export default function App() {
     }
   };
 
+  const handleApplyGuardrailPatch = async (
+    targetRouteName: string,
+    suggestedUtterances: string[]
+  ) => {
+    const res = await fetch('/api/redteam/apply-patch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetRouteName, suggestedUtterances }),
+    });
+    if (!res.ok) {
+      const data = (await res.json()) as { error?: string };
+      throw new Error(data.error || 'Failed to apply guardrail patch');
+    }
+    const data = (await res.json()) as {
+      updatedRoute: RouteDefinition;
+      addedCount: number;
+      routes: RouteDefinition[];
+    };
+    setRoutes(data.routes);
+    return data;
+  };
+
   const navItems: Array<{ id: NavTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
     { id: 'playground', label: 'Playground', icon: Terminal },
     { id: 'routes', label: 'Routes', icon: GitBranch },
     { id: 'instructions', label: 'System Instructions', icon: SlidersHorizontal },
     { id: 'progress', label: 'Progress', icon: Compass },
     { id: 'evaluation', label: 'Evaluation & Fit', icon: BarChart3 },
+    { id: 'redteam', label: 'Red-Team Bot', icon: ShieldAlert },
     { id: 'providers', label: 'Providers & E5', icon: Cpu },
     { id: 'sdk', label: 'SDK & API', icon: Code2 },
   ];
@@ -991,6 +1018,14 @@ export default function App() {
                   onRunFit={handleRunFit}
                   onAddEvalCase={handleAddEvalCase}
                   onDeleteEvalCase={handleDeleteEvalCase}
+                />
+              )}
+
+              {activeTab === 'redteam' && (
+                <RedTeamView
+                  routes={routes}
+                  onApplyPatch={handleApplyGuardrailPatch}
+                  onRefreshRoutes={loadWorkspace}
                 />
               )}
 

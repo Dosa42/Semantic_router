@@ -530,3 +530,62 @@ export interface LibraryKnowledgeState {
   comparisonMatrix: ArchitectureComparisonRow[];
 }
 
+export type RedTeamStrategy =
+  | 'semantic_cloaking'
+  | 'metaphorical_framing'
+  | 'cross_language'
+  | 'hypothetical_scaffolding'
+  | 'adversarial_obfuscation'
+  | 'payload_splitting';
+
+export interface RedTeamProbeResult {
+  id: string;
+  strategy: RedTeamStrategy;
+  strategyLabel: string;
+  prompt: string;
+  baseArchetype: string;
+  targetRouteName: string;
+  threshold: number;
+  matchedRouteName: string | null;
+  topScore: number;
+  scoreMargin: number;
+  guardrailFired: boolean;
+  bypassFound: boolean;
+  perEncoderScores?: Partial<Record<EmbeddingSlotRole, number>>;
+}
+
+export interface RedTeamRecommendation {
+  id: string;
+  targetRouteName: string;
+  strategy: RedTeamStrategy;
+  issueCategory: string;
+  suggestedUtterances: string[];
+  reason: string;
+  severity: 'high' | 'medium' | 'low';
+  applied?: boolean;
+}
+
+export interface RedTeamCampaignReport {
+  id: string;
+  timestamp: string;
+  targetRouteNames: string[];
+  totalProbes: number;
+  blockedCount: number;
+  bypassCount: number;
+  bypassRate: number;
+  minBypassScore: number | null;
+  strategyStats: Record<
+    RedTeamStrategy,
+    { tested: number; blocked: number; bypassed: number; minScore: number }
+  >;
+  probes: RedTeamProbeResult[];
+  recommendations: RedTeamRecommendation[];
+  executionLogs: string[];
+}
+
+export interface RedTeamCampaignOptions {
+  targetRouteNames?: string[];
+  strategies?: RedTeamStrategy[];
+  variantsPerStrategy?: number;
+  customBaseArchetypes?: string[];
+}

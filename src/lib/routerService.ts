@@ -61,6 +61,9 @@ import type {
   RagConnector,
   RagQueryResult,
   RagRetrievalMatch,
+  RedTeamCampaignOptions,
+  RedTeamCampaignReport,
+  RedTeamRecommendation,
   RouteDecisionResult,
   RouteDefinition,
   RouteInstructionOverride,
@@ -69,6 +72,7 @@ import type {
   SystemInstructionsConfig,
   TelemetryEdgeId,
 } from './types.ts';
+import { applyGuardrailPatch, runRedTeamCampaign } from './redTeamEngine.ts';
 
 interface PersistedState {
   routes: RouteDefinition[];
@@ -325,6 +329,7 @@ export class UnifiedRouterService {
   private lastRagError: string | null = null;
   private mcpCallCount = 0;
   private readonly mcpLogs: McpStdioLogEntry[] = [];
+  private readonly redTeamHistory: RedTeamCampaignReport[] = [];
   private stateFileMtimeMs = 0;
 
   constructor(
@@ -1900,6 +1905,72 @@ export class UnifiedRouterService {
       endRag('error');
       throw err;
     }
+  }
+
+  async runRedTeamCampaign(options: RedTeamCampaignOptions = {}): Promise<RedTeamCampaignReport> {
+    this.reloadStateIfModified();
+    const ensembleConfig = this.getEffectiveEnsembleConfig();
+    const allTexts = this.state.routes.flatMap((r) => r.utterances);
+
+    const slotLookups: EnsembleSlotLookup[] = [];
+    for (const slot of ensembleConfig.slots) {
+      if (slot.enabled) {
+        const sl = await this.buildSlotVectorLookup(slot, [], this.state.routes, false);
+        slotLookups.push(sl);
+      }
+    }
+
+    const ensembleLookup = {
+      slots: slotLookups,
+      fusionMode: ensembleConfig.fusionMode,
+    };
+
+    const report = runRedTeamCampaign(
+      this.state.routes,
+      this.state.config,
+      ensembleLookup,
+      options
+    );
+
+    this.redTeamHistory.unshift(report);
+    if (this.redTeamHistory.length > 20) {
+      this.redTeamHistory.pop();
+    }
+    this.telemetry.notify();
+    return report;
+  }
+
+  getRedTeamHistory(): RedTeamCampaignReport[] {
+    return this.redTeamHistory;
+  }
+
+  applyGuardrailPatch(targetRouteName: string, suggestedUtterances: string[]): {
+    updatedRoute: RouteDefinition;
+    addedCount: number;
+    routes: RouteDefinition[];
+  } {
+    this.reloadStateIfModified();
+    const res = applyGuardrailPatch(this.state.routes, targetRouteName, suggestedUtterances);
+    this.state.routes = res.updatedRoutes;
+    this.saveState();
+
+    const updated = this.state.routes.find((r) => r.name === targetRouteName) || this.state.routes[0];
+
+    // Mark recommendation as applied in the latest campaign
+    if (this.redTeamHistory.length > 0) {
+      for (const rec of this.redTeamHistory[0].recommendations) {
+        if (rec.targetRouteName === targetRouteName) {
+          rec.applied = true;
+        }
+      }
+    }
+
+    this.telemetry.notify();
+    return {
+      updatedRoute: updated,
+      addedCount: res.addedCount,
+      routes: this.state.routes,
+    };
   }
 
   resetWorkspace() {

@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -19,6 +20,7 @@ import type {
   OpenAiFlowMode,
   ProjectMilestone,
   RagConnector,
+  RedTeamCampaignOptions,
   RouteDefinition,
   RouterConfig,
   SystemInstructionsConfig,
@@ -520,6 +522,73 @@ async function startServer() {
   app.post('/api/knowledge/reset', (_req, res) => {
     const knowledge = service.resetLibraryKnowledge();
     res.json({ knowledge });
+  });
+
+  // --- Autonomous Red-Team Bot & Guardrail Hardener API ---
+
+  app.post('/api/redteam/run', async (req, res) => {
+    try {
+      const options = (req.body ?? {}) as RedTeamCampaignOptions;
+      const report = await service.runRedTeamCampaign(options);
+      res.json({ report });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/redteam/history', (_req, res) => {
+    res.json({ history: service.getRedTeamHistory() });
+  });
+
+  app.post('/api/redteam/apply-patch', (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        targetRouteName?: string;
+        suggestedUtterances?: string[];
+      };
+      if (!body.targetRouteName || !Array.isArray(body.suggestedUtterances)) {
+        res.status(400).json({
+          error: 'targetRouteName and suggestedUtterances array are required.',
+        });
+        return;
+      }
+      const result = service.applyGuardrailPatch(
+        body.targetRouteName,
+        body.suggestedUtterances
+      );
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/frida/scripts', (_req, res) => {
+    try {
+      const fridaDir = path.join(__dirname, 'frida');
+      const onnxHook = fs.existsSync(path.join(fridaDir, 'onnx_hook.js'))
+        ? fs.readFileSync(path.join(fridaDir, 'onnx_hook.js'), 'utf-8')
+        : '';
+      const trinityHook = fs.existsSync(path.join(fridaDir, 'trinity_socket_hook.js'))
+        ? fs.readFileSync(path.join(fridaDir, 'trinity_socket_hook.js'), 'utf-8')
+        : '';
+      const runner = fs.existsSync(path.join(fridaDir, 'run_instrumentation.sh'))
+        ? fs.readFileSync(path.join(fridaDir, 'run_instrumentation.sh'), 'utf-8')
+        : '';
+      const readme = fs.existsSync(path.join(fridaDir, 'README.md'))
+        ? fs.readFileSync(path.join(fridaDir, 'README.md'), 'utf-8')
+        : '';
+
+      res.json({
+        scripts: {
+          onnxHook,
+          trinityHook,
+          runner,
+          readme,
+        },
+      });
+    } catch (err) {
+      res.status(500).json({ error: (err as Error).message });
+    }
   });
 
   // --- Unified RAG Server & External Webhook/URL Connectors ---
