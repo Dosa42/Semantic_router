@@ -1,0 +1,468 @@
+import type {
+  EncoderModelId,
+  TelemetryEndpointMetric,
+  TelemetryPortBinding,
+  TelemetrySnapshot,
+  TelemetrySubsystemId,
+  TelemetrySubsystemStatus,
+  TelemetryTraceEvent,
+} from './types.ts';
+
+const SENSITIVE_KEYS = new Set([
+  'accesstoken',
+  'refreshtoken',
+  'idtoken',
+  'access_token',
+  'refresh_token',
+  'id_token',
+  'client_secret',
+  'clientsecret',
+  'authorization',
+  'codeverifier',
+  'code_verifier',
+  'cookie',
+  'password',
+  'secret',
+]);
+
+export function sanitizeTelemetryPayload(value: unknown, depth = 0): unknown {
+  if (value === null || value === undefined) return value ?? null;
+  if (depth > 5) return '[TRUNCATED]';
+
+  if (typeof value === 'string') {
+    if (value.length > 500) {
+      return `${value.slice(0, 500)}… (+${value.length - 500} chars)`;
+    }
+    return value;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+
+  if (Array.isArray(value)) {
+    const sliced = value.slice(0, 12).map((item) => sanitizeTelemetryPayload(item, depth + 1));
+    if (value.length > 12) {
+      sliced.push(`… (+${value.length - 12} items)`);
+    }
+    return sliced;
+  }
+
+  if (typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    const entries = Object.entries(value as Record<string, unknown>);
+    for (const [key, val] of entries.slice(0, 24)) {
+      if (SENSITIVE_KEYS.has(key.toLowerCase())) {
+        out[key] = '[REDACTED]';
+      } else {
+        out[key] = sanitizeTelemetryPayload(val, depth + 1);
+      }
+    }
+    if (entries.length > 24) {
+      out.__truncatedKeys = entries.length - 24;
+    }
+    return out;
+  }
+
+  return String(value);
+}
+
+export function classifyEndpointTelemetry(
+  method: string,
+  reqPath: string
+): {
+  routePattern: string;
+  subsystem: TelemetrySubsystemId;
+  targetNode: string;
+} {
+  const cleanMethod = method.toUpperCase();
+  const pathOnly = reqPath.split('?')[0] || '/';
+
+  if (pathOnly.startsWith('/api/auth/openai') || pathOnly.startsWith('/auth/openai') || pathOnly.startsWith('/auth/callback')) {
+    return {
+      routePattern: `${cleanMethod} ${pathOnly}`,
+      subsystem: 'ai_model',
+      targetNode: 'openai-oauth-llm',
+    };
+  }
+  if (pathOnly.startsWith('/api/providers/embed-test')) {
+    return {
+      routePattern: `${cleanMethod} ${pathOnly}`,
+      subsystem: 'embedding_model',
+      targetNode: 'e5-onnx-worker',
+    };
+  }
+  if (pathOnly === '/api/providers' || pathOnly.startsWith('/api/providers/execute')) {
+    const isEmbedInfo = pathOnly === '/api/providers';
+    return {
+      routePattern: `${cleanMethod} ${pathOnly}`,
+      subsystem: isEmbedInfo ? 'embedding_model' : 'ai_model',
+      targetNode: isEmbedInfo ? 'e5-onnx-worker' : 'openai-oauth-llm',
+    };
+  }
+  if (pathOnly.startsWith('/api/routes/') && pathOnly.split('/').length === 4) {
+    return {
+      routePattern: `${cleanMethod} /api/routes/:id`,
+      subsystem: 'semantic_router',
+      targetNode: 'semantic-router-rag',
+    };
+  }
+  if (pathOnly.startsWith('/api/eval-cases/') && pathOnly.split('/').length === 4) {
+    return {
+      routePattern: `${cleanMethod} /api/eval-cases/:id`,
+      subsystem: 'semantic_router',
+      targetNode: 'semantic-router-rag',
+    };
+  }
+  return {
+    routePattern: `${cleanMethod} ${pathOnly}`,
+    subsystem: 'semantic_router',
+    targetNode: 'semantic-router-rag',
+  };
+}
+
+export interface SubsystemStateInput {
+  expressPort: number;
+  chatGptConnected: boolean;
+  chatGptSharing: boolean;
+  chatGptEmail: string | null;
+  pendingAuthCount: number;
+  lastOpenAiError: string | null;
+  lastOpenAiLatencyMs: number | null;
+  activeRouteCount: number;
+  totalRouteCount: number;
+  isEvaluatingOrFitting: boolean;
+  lastRouterError: string | null;
+  lastRouteLatencyMs: number | null;
+  encoderModel: EncoderModelId;
+  e5Status: 'idle' | 'loading' | 'ready' | 'error';
+  e5CachedCount: number;
+  lastEmbedLatencyMs: number | null;
+  loopbackListening: boolean;
+  loopbackPort: number | null;
+}
+
+export function computeSubsystemSignals(input: SubsystemStateInput): {
+  subsystems: TelemetrySubsystemStatus[];
+  ports: TelemetryPortBinding[];
+} {
+  // 1. Left: AI Model (OpenAI Sign in with ChatGPT + Responses API)
+  let aiLamp: TelemetrySubsystemStatus['lamp'] = 'red';
+  let aiStatusText = 'AUTH_REQ';
+  let aiDetail = 'Sign in with ChatGPT required for OpenAI routes';
+  if (input.lastOpenAiError) {
+    aiLamp = 'red';
+    aiStatusText = 'ERROR';
+    aiDetail = input.lastOpenAiError;
+  } else if (input.chatGptConnected && input.chatGptSharing) {
+    aiLamp = 'green';
+    aiStatusText = 'READY';
+    aiDetail = input.chatGptEmail
+      ? `Plan sharing active (${input.chatGptEmail})`
+      : 'ChatGPT plan usage active';
+  } else if (input.chatGptConnected || input.pendingAuthCount > 0) {
+    aiLamp = 'yellow';
+    aiStatusText = input.pendingAuthCount > 0 ? 'PENDING' : 'ID_ONLY';
+    aiDetail =
+      input.pendingAuthCount > 0
+        ? 'OAuth / device flow awaiting user consent'
+        : 'Signed in without chatgpt.tokens.use.direct scope';
+  }
+
+  // 2. Middle: Semantic Router RAG (Hybrid / Dense / Sparse route index)
+  let routerLamp: TelemetrySubsystemStatus['lamp'] = 'green';
+  let routerStatusText = 'ONLINE';
+  let routerDetail = `${input.activeRouteCount}/${input.totalRouteCount} routes active`;
+  if (input.lastRouterError || input.activeRouteCount === 0) {
+    routerLamp = 'red';
+    routerStatusText = input.activeRouteCount === 0 ? 'NO_ROUTES' : 'ERROR';
+    routerDetail = input.lastRouterError ?? 'Zero enabled semantic routes in index';
+  } else if (input.isEvaluatingOrFitting) {
+    routerLamp = 'yellow';
+    routerStatusText = 'OPTIMIZING';
+    routerDetail = 'Evaluating dataset / fitting route thresholds';
+  }
+
+  // 3. Right: Embedding Model (intfloat/e5-small-v2 ONNX or BM25)
+  let embedLamp: TelemetrySubsystemStatus['lamp'] = 'yellow';
+  let embedStatusText = 'WARMING';
+  let embedDetail = 'Loading Xenova/e5-small-v2 q8 ONNX weights';
+  if (input.encoderModel === 'local-subword-bm25') {
+    embedLamp = 'green';
+    embedStatusText = 'READY';
+    embedDetail = 'Subword 256d + BM25 lexical index ready';
+  } else if (input.e5Status === 'error') {
+    embedLamp = 'red';
+    embedStatusText = 'ERROR';
+    embedDetail = 'ONNX pipeline failed; fallback active';
+  } else if (input.e5Status === 'ready') {
+    embedLamp = 'green';
+    embedStatusText = 'READY';
+    embedDetail = `384d vectors · ${input.e5CachedCount} cached`;
+  } else if (input.e5Status === 'idle') {
+    embedLamp = 'yellow';
+    embedStatusText = 'IDLE';
+    embedDetail = 'Awaiting ONNX warmup request';
+  }
+
+  const subsystems: TelemetrySubsystemStatus[] = [
+    {
+      id: 'ai_model',
+      label: 'AI Model',
+      target: 'OpenAI ChatGPT',
+      lamp: aiLamp,
+      statusText: aiStatusText,
+      detail: aiDetail,
+      portOrRuntime: ':443 HTTPS',
+      lastLatencyMs: input.lastOpenAiLatencyMs,
+    },
+    {
+      id: 'semantic_router',
+      label: 'Semantic Router',
+      target: 'RAG Index Engine',
+      lamp: routerLamp,
+      statusText: routerStatusText,
+      detail: routerDetail,
+      portOrRuntime: `:${input.expressPort} HTTP`,
+      lastLatencyMs: input.lastRouteLatencyMs,
+    },
+    {
+      id: 'embedding_model',
+      label: 'Embedding Model',
+      target: input.encoderModel === 'e5-small-v2' ? 'e5-small-v2' : 'subword-bm25',
+      lamp: embedLamp,
+      statusText: embedStatusText,
+      detail: embedDetail,
+      portOrRuntime: 'ONNX 384d',
+      lastLatencyMs: input.lastEmbedLatencyMs,
+    },
+  ];
+
+  const ports: TelemetryPortBinding[] = [
+    {
+      port: input.expressPort,
+      protocol: 'HTTP',
+      service: 'Express API + Vite App Server',
+      state: 'listening',
+      detail: '0.0.0.0:3000 (/api/* & SPA)',
+      subsystem: 'semantic_router',
+    },
+    {
+      port: input.loopbackPort ?? 1455,
+      protocol: 'HTTP',
+      service: 'OAuth Loopback Callback Listener',
+      state: input.loopbackListening ? 'listening' : 'standby',
+      detail: input.loopbackListening
+        ? `127.0.0.1:${input.loopbackPort ?? 1455}/auth/callback active`
+        : 'Binds 127.0.0.1:1455 during PKCE sign-in',
+      subsystem: 'ai_model',
+    },
+    {
+      port: 443,
+      protocol: 'HTTPS',
+      service: 'auth.openai.com & api.openai.com/v1',
+      state: input.lastOpenAiError ? 'error' : input.chatGptConnected ? 'egress' : 'standby',
+      detail: 'OIDC PKCE + Device Auth + Responses SSE',
+      subsystem: 'ai_model',
+    },
+    {
+      port: 0,
+      protocol: 'ONNX',
+      service: 'Xenova/e5-small-v2 Feature Extractor',
+      state:
+        input.e5Status === 'error'
+          ? 'error'
+          : input.e5Status === 'ready'
+            ? 'ready'
+            : 'warming',
+      detail: `${input.e5CachedCount} normalized vectors in memory`,
+      subsystem: 'embedding_model',
+    },
+  ];
+
+  return { subsystems, ports };
+}
+
+const DEFAULT_ENDPOINTS: Array<{
+  method: TelemetryEndpointMetric['method'];
+  path: string;
+  subsystem: TelemetrySubsystemId;
+  targetNode: string;
+}> = [
+  { method: 'POST', path: '/api/route', subsystem: 'semantic_router', targetNode: 'semantic-router-rag' },
+  { method: 'POST', path: '/api/evaluate', subsystem: 'semantic_router', targetNode: 'semantic-router-rag' },
+  { method: 'POST', path: '/api/fit', subsystem: 'semantic_router', targetNode: 'semantic-router-rag' },
+  { method: 'GET', path: '/api/routes', subsystem: 'semantic_router', targetNode: 'semantic-router-rag' },
+  { method: 'POST', path: '/api/providers/embed-test', subsystem: 'embedding_model', targetNode: 'e5-onnx-worker' },
+  { method: 'GET', path: '/api/providers', subsystem: 'embedding_model', targetNode: 'e5-onnx-worker' },
+  { method: 'POST', path: '/api/providers/execute', subsystem: 'ai_model', targetNode: 'openai-oauth-llm' },
+  { method: 'POST', path: '/api/auth/openai/preview', subsystem: 'ai_model', targetNode: 'openai-oauth-llm' },
+  { method: 'POST', path: '/api/auth/openai/start', subsystem: 'ai_model', targetNode: 'openai-oauth-llm' },
+  { method: 'POST', path: '/api/auth/openai/device/start', subsystem: 'ai_model', targetNode: 'openai-oauth-llm' },
+  { method: 'POST', path: '/api/auth/openai/device/poll', subsystem: 'ai_model', targetNode: 'openai-oauth-llm' },
+  { method: 'POST', path: '/api/auth/openai/verify', subsystem: 'ai_model', targetNode: 'openai-oauth-llm' },
+  { method: 'GET', path: '/api/health', subsystem: 'semantic_router', targetNode: 'semantic-router-rag' },
+];
+
+export class TelemetryCollector {
+  private readonly startedAt = Date.now();
+  private readonly traces: TelemetryTraceEvent[] = [];
+  private readonly endpointMap = new Map<string, TelemetryEndpointMetric>();
+  private readonly listeners = new Set<(snapshot: TelemetrySnapshot) => void>();
+  private activeFlowEdge: string | null = null;
+  private stateProvider: (() => SubsystemStateInput) | null = null;
+
+  constructor() {
+    for (const def of DEFAULT_ENDPOINTS) {
+      const id = `${def.method} ${def.path}`;
+      this.endpointMap.set(id, {
+        id,
+        method: def.method,
+        path: def.path,
+        subsystem: def.subsystem,
+        targetNode: def.targetNode,
+        hits: 0,
+        errors: 0,
+        lastStatus: null,
+        avgLatencyMs: null,
+        lastLatencyMs: null,
+        lastCalledAt: null,
+      });
+    }
+  }
+
+  attachStateProvider(fn: () => SubsystemStateInput): void {
+    this.stateProvider = fn;
+  }
+
+  subscribe(listener: (snapshot: TelemetrySnapshot) => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  notify(): void {
+    if (this.listeners.size === 0) return;
+    const snap = this.getSnapshot();
+    for (const fn of this.listeners) {
+      try {
+        fn(snap);
+      } catch {
+        // Ignore broken SSE stream
+      }
+    }
+  }
+
+  recordHttpEvent(event: {
+    method: string;
+    path: string;
+    status: number;
+    durationMs: number;
+    requestBody: unknown;
+    responseBody: unknown;
+  }): void {
+    const info = classifyEndpointTelemetry(event.method, event.path);
+    const nowIso = new Date().toISOString();
+    const roundedMs = Math.round(event.durationMs * 100) / 100;
+
+    const existing = this.endpointMap.get(info.routePattern);
+    if (existing) {
+      const totalHits = existing.hits + 1;
+      const prevSum = (existing.avgLatencyMs ?? 0) * existing.hits;
+      existing.hits = totalHits;
+      if (event.status >= 400) existing.errors += 1;
+      existing.lastStatus = event.status;
+      existing.lastLatencyMs = roundedMs;
+      existing.avgLatencyMs = Math.round(((prevSum + roundedMs) / totalHits) * 100) / 100;
+      existing.lastCalledAt = nowIso;
+    } else {
+      const cleanMethod = event.method.toUpperCase();
+      const methodEnum: TelemetryEndpointMetric['method'] =
+        cleanMethod === 'POST' ||
+        cleanMethod === 'PUT' ||
+        cleanMethod === 'DELETE'
+          ? cleanMethod
+          : 'GET';
+      this.endpointMap.set(info.routePattern, {
+        id: info.routePattern,
+        method: methodEnum,
+        path: info.routePattern.replace(/^[A-Z]+\s+/, ''),
+        subsystem: info.subsystem,
+        targetNode: info.targetNode,
+        hits: 1,
+        errors: event.status >= 400 ? 1 : 0,
+        lastStatus: event.status,
+        avgLatencyMs: roundedMs,
+        lastLatencyMs: roundedMs,
+        lastCalledAt: nowIso,
+      });
+    }
+
+    this.activeFlowEdge = info.targetNode;
+
+    const trace: TelemetryTraceEvent = {
+      id: `tel-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      timestamp: nowIso,
+      method: event.method.toUpperCase(),
+      path: event.path,
+      routePattern: info.routePattern,
+      status: event.status,
+      durationMs: roundedMs,
+      subsystem: info.subsystem,
+      sourceNode: 'express-gateway',
+      targetNode: info.targetNode,
+      requestBody: sanitizeTelemetryPayload(event.requestBody),
+      responseBody: sanitizeTelemetryPayload(event.responseBody),
+    };
+
+    this.traces.unshift(trace);
+    if (this.traces.length > 40) {
+      this.traces.length = 40;
+    }
+
+    this.notify();
+  }
+
+  getSnapshot(): TelemetrySnapshot {
+    const state = this.stateProvider
+      ? this.stateProvider()
+      : {
+          expressPort: 3000,
+          chatGptConnected: false,
+          chatGptSharing: false,
+          chatGptEmail: null,
+          pendingAuthCount: 0,
+          lastOpenAiError: null,
+          lastOpenAiLatencyMs: null,
+          activeRouteCount: 0,
+          totalRouteCount: 0,
+          isEvaluatingOrFitting: false,
+          lastRouterError: null,
+          lastRouteLatencyMs: null,
+          encoderModel: 'e5-small-v2' as EncoderModelId,
+          e5Status: 'idle' as const,
+          e5CachedCount: 0,
+          lastEmbedLatencyMs: null,
+          loopbackListening: false,
+          loopbackPort: null,
+        };
+
+    const { subsystems, ports } = computeSubsystemSignals(state);
+
+    const endpoints = Array.from(this.endpointMap.values()).sort((a, b) => {
+      if (b.hits !== a.hits) return b.hits - a.hits;
+      return a.path.localeCompare(b.path);
+    });
+
+    return {
+      timestamp: new Date().toISOString(),
+      uptimeSec: Math.max(0, Math.floor((Date.now() - this.startedAt) / 1000)),
+      expressPort: state.expressPort,
+      loopbackListening: state.loopbackListening,
+      loopbackPort: state.loopbackPort,
+      activeFlowEdge: this.activeFlowEdge,
+      subsystems,
+      ports,
+      endpoints,
+      recentTraces: [...this.traces],
+    };
+  }
+}
