@@ -4,11 +4,26 @@ import { AgentStateStore } from './agentState.ts';
 import type { ChatGptAuthManager } from './chatgptAuth.ts';
 import { EmbeddingEnsembleRunner } from './embeddingEnsemble.ts';
 import { formatEmbeddingText, resolveChatGptSystemPrompt } from './instructions.ts';
+import {
+  MODEL_SPECS,
+  inspectLocalModelRegistry,
+  resolveTransformersModelTarget,
+} from './modelRegistry.ts';
 import { ProjectProgressTracker } from './progressTracker.ts';
 import {
   ENCODER_PROVIDERS,
   executeLocalProviderFunction,
 } from './providers.ts';
+import {
+  deletePackageVectorStoreByConnector,
+  discoverZipArchives,
+  extractAndChunkZipArchive,
+  loadAllPackageVectorStores,
+  normalizeVectorInPlace,
+  savePackageVectorStore,
+  scorePackageVectorStore,
+  type LoadedPackageStore,
+} from './packageIngestor.ts';
 import { fetchAndChunkConnector, scoreRagChunks } from './ragEngine.ts';
 import {
   checkTrinityHealth,
@@ -40,6 +55,8 @@ import type { TelemetryCollector } from './telemetry.ts';
 import { DEFAULT_LIBRARY_KNOWLEDGE } from './architectureBlueprints.ts';
 import type {
   AgentStateSnapshot,
+  ArchiveFilterProfile,
+  DiscoveredZipArchive,
   EmbeddingSlotConfig,
   EmbeddingSlotRole,
   EncoderModelId,
@@ -51,7 +68,9 @@ import type {
   ExtractedFunctionCall,
   FitReport,
   FunctionSchema,
+  IngestedPackageManifest,
   LibraryKnowledgeState,
+  LocalModelInventoryItem,
   McpStdioLogEntry,
   MilestoneProgress,
   ProjectMilestone,
@@ -87,7 +106,7 @@ interface PersistedState {
 
 type FeatureExtractor = (
   texts: string[],
-  options: { pooling: 'mean'; normalize: boolean }
+  options: { pooling: 'mean' | 'cls'; normalize: boolean }
 ) => Promise<{ tolist: () => number[][] }>;
 
 function migrateLegacyTargetModel(target: string): string {
@@ -99,6 +118,8 @@ function migrateLegacyTargetModel(target: string): string {
 function migrateLegacyEncoder(enc: string | undefined): EncoderModelId {
   if (enc === 'local-subword-bm25') return 'local-subword-bm25';
   if (enc === 'bge-m3') return 'bge-m3';
+  if (enc === 'e5-base-v2') return 'e5-base-v2';
+  if (enc === 'e5-large-v2') return 'e5-large-v2';
   return 'e5-small-v2';
 }
 
@@ -143,6 +164,8 @@ function normalizeEnsembleConfig(raw?: Partial<EnsembleConfig>): EnsembleConfig 
 export class EnsembleModelManager {
   private readonly caches = new Map<EncoderModelId, Map<string, number[]>>([
     ['e5-small-v2', new Map()],
+    ['e5-base-v2', new Map()],
+    ['e5-large-v2', new Map()],
     ['local-subword-bm25', new Map()],
     ['bge-m3', new Map()],
   ]);
@@ -158,19 +181,20 @@ export class EnsembleModelManager {
   ]);
   private readonly backendMap = new Map<EncoderModelId, 'onnx' | 'local-fallback'>([
     ['e5-small-v2', 'local-fallback'],
+    ['e5-base-v2', 'local-fallback'],
+    ['e5-large-v2', 'local-fallback'],
     ['local-subword-bm25', 'local-fallback'],
     ['bge-m3', 'local-fallback'],
   ]);
 
   constructor(
-    private readonly getE5ExtractorFn: () => Promise<FeatureExtractor>,
+    private readonly getOnnxExtractorFn: (modelId: EncoderModelId) => Promise<FeatureExtractor>,
+    private readonly hasLocalLfsModelFn: (modelId: EncoderModelId) => boolean,
     private readonly onNotify?: () => void
   ) {}
 
   getDimensions(modelId: EncoderModelId): number {
-    if (modelId === 'e5-small-v2') return 384;
-    if (modelId === 'bge-m3') return 1024;
-    return 256;
+    return MODEL_SPECS[modelId]?.dimensions ?? 256;
   }
 
   getStatus(role: EmbeddingSlotRole): 'idle' | 'loading' | 'ready' | 'error' {
@@ -198,20 +222,21 @@ export class EnsembleModelManager {
       this.statusMap.set(slot.role, 'ready');
       return;
     }
-    if (slot.modelId === 'bge-m3') {
-      // Deterministic 1024-dim semantic projection is ready immediately; remote ONNX is optional
-      this.backendMap.set('bge-m3', 'local-fallback');
+
+    const canRunOnnx = slot.modelId === 'e5-small-v2' || this.hasLocalLfsModelFn(slot.modelId);
+    if (!canRunOnnx) {
+      this.backendMap.set(slot.modelId, 'local-fallback');
       this.statusMap.set(slot.role, 'ready');
       return;
     }
-    // e5-small-v2
+
     this.statusMap.set(slot.role, 'loading');
     try {
-      await this.getE5ExtractorFn();
-      this.backendMap.set('e5-small-v2', 'onnx');
+      await this.getOnnxExtractorFn(slot.modelId);
+      this.backendMap.set(slot.modelId, 'onnx');
       this.statusMap.set(slot.role, 'ready');
     } catch {
-      this.backendMap.set('e5-small-v2', 'local-fallback');
+      this.backendMap.set(slot.modelId, 'local-fallback');
       this.statusMap.set(slot.role, 'ready');
     }
   }
@@ -236,27 +261,35 @@ export class EnsembleModelManager {
     const cache = this.caches.get(modelId) ?? new Map<string, number[]>();
     this.caches.set(modelId, cache);
     const dims = this.getDimensions(modelId);
+    const spec = MODEL_SPECS[modelId] ?? MODEL_SPECS['local-subword-bm25'];
 
     const formattedList = texts.map((t) =>
-      modelId === 'bge-m3' ? `Represent this sentence: ${t}` : t
+      modelId === 'bge-m3' && !this.hasLocalLfsModelFn('bge-m3')
+        ? `Represent this sentence: ${t}`
+        : t
     );
     const missing = Array.from(new Set(formattedList)).filter((k) => k.length > 0 && !cache.has(k));
 
     if (missing.length > 0) {
-      if (modelId === 'e5-small-v2') {
+      const canRunOnnx =
+        spec.supportsOnnx &&
+        (modelId === 'e5-small-v2' || this.hasLocalLfsModelFn(modelId));
+
+      if (canRunOnnx) {
         try {
-          const ext = await this.getE5ExtractorFn();
-          for (let i = 0; i < missing.length; i += 24) {
-            const batch = missing.slice(i, i + 24);
-            const out = await ext(batch, { pooling: 'mean', normalize: true });
+          const ext = await this.getOnnxExtractorFn(modelId);
+          const pooling = spec.pooling === 'cls' ? 'cls' : 'mean';
+          for (let i = 0; i < missing.length; i += 16) {
+            const batch = missing.slice(i, i + 16);
+            const out = await ext(batch, { pooling, normalize: true });
             const vecs = out.tolist();
             batch.forEach((key, idx) => {
               cache.set(key, vecs[idx]);
             });
           }
-          this.backendMap.set('e5-small-v2', 'onnx');
+          this.backendMap.set(modelId, 'onnx');
         } catch {
-          this.backendMap.set('e5-small-v2', 'local-fallback');
+          this.backendMap.set(modelId, 'local-fallback');
           for (const key of missing) {
             cache.set(key, computeLocalDenseVector(key, dims));
           }
@@ -305,14 +338,17 @@ export class EnsembleModelManager {
 }
 
 export class UnifiedRouterService {
+  private readonly rootDir: string;
   private readonly dataDir: string;
+  private readonly packagesDir: string;
   private readonly stateFile: string;
   private readonly knowledgeFile: string;
   private state: PersistedState;
   private libraryKnowledge: LibraryKnowledgeState;
+  private packageStores: LoadedPackageStore[] = [];
 
   private readonly e5EmbeddingCache = new Map<string, number[]>();
-  private e5PipelinePromise: Promise<FeatureExtractor> | null = null;
+  private readonly onnxExtractors = new Map<EncoderModelId, Promise<FeatureExtractor>>();
   private e5Status: 'idle' | 'loading' | 'ready' | 'error' = 'idle';
 
   private readonly agentState: AgentStateStore;
@@ -337,17 +373,21 @@ export class UnifiedRouterService {
     private readonly chatgptAuth: ChatGptAuthManager,
     private readonly telemetry: TelemetryCollector
   ) {
+    this.rootDir = rootDir;
     this.dataDir = path.join(rootDir, 'data');
+    this.packagesDir = path.join(this.dataDir, 'packages');
     this.stateFile = path.join(this.dataDir, 'router-state.json');
     this.knowledgeFile = path.join(this.dataDir, 'library-knowledge.json');
 
     this.agentState = new AgentStateStore();
     this.ensembleManager = new EnsembleModelManager(
-      () => this.getE5Extractor(),
+      (modelId) => this.getOnnxExtractor(modelId),
+      (modelId) => this.hasLocalLfsModel(modelId),
       () => this.telemetry.notify()
     );
 
     this.state = this.loadState();
+    this.syncLoadedPackageStoresIntoConnectors(false);
 
     const stateSlotModel = (): EncoderModelId =>
       this.getEffectiveEnsembleConfig().slots.find((s) => s.role === 'state')?.modelId ?? 'bge-m3';
@@ -448,6 +488,100 @@ export class UnifiedRouterService {
     }
   }
 
+  private ensurePackageRoutesRegistered(): boolean {
+    let changed = false;
+    const hasReaPkg = this.packageStores.some(
+      (s) => s.manifest.id.includes('rea-agents') || s.manifest.packageName.includes('rea-agents')
+    );
+    if (hasReaPkg) {
+      const existingIdx = this.state.routes.findIndex(
+        (r) => r.id === 'route-rea-agents' || r.name === 'rea_agents'
+      );
+      if (existingIdx === -1) {
+        const seedReaRoute = SEED_ROUTES.find((r) => r.id === 'route-rea-agents');
+        if (seedReaRoute) {
+          this.state.routes.push(structuredClone(seedReaRoute));
+          changed = true;
+        }
+      }
+    }
+    return changed;
+  }
+
+  private syncLoadedPackageStoresIntoConnectors(persistIfChanged = false): void {
+    this.packageStores = loadAllPackageVectorStores(this.packagesDir);
+    let changed = this.ensurePackageRoutesRegistered();
+
+    for (const store of this.packageStores) {
+      const m = store.manifest;
+      const pkgUrl = `package://${m.sourceArchive}`;
+      const existingIdx = this.state.ragConnectors.findIndex((c) => c.id === m.connectorId);
+
+      if (existingIdx === -1) {
+        this.state.ragConnectors.push({
+          id: m.connectorId,
+          name: m.connectorName,
+          url: pkgUrl,
+          method: 'GET',
+          headers: {},
+          parserMode: 'auto',
+          boundRouteIds: [],
+          chunkSize: 1800,
+          chunkOverlap: 120,
+          enabled: true,
+          lastSyncedAt: m.ingestedAt,
+          lastStatus: 'ok',
+          lastLatencyMs: m.latencyMs,
+          lastError: null,
+          chunkCount: m.chunkCount,
+        });
+        changed = true;
+      } else {
+        const existing = this.state.ragConnectors[existingIdx];
+        if (
+          existing.chunkCount !== m.chunkCount ||
+          existing.url !== pkgUrl ||
+          existing.lastStatus !== 'ok'
+        ) {
+          this.state.ragConnectors[existingIdx] = {
+            ...existing,
+            name: m.connectorName,
+            url: pkgUrl,
+            lastSyncedAt: m.ingestedAt,
+            lastStatus: 'ok',
+            lastLatencyMs: m.latencyMs,
+            lastError: null,
+            chunkCount: m.chunkCount,
+          };
+          changed = true;
+        }
+      }
+    }
+
+    if (changed && persistIfChanged) {
+      this.saveState();
+    }
+  }
+
+  reloadPackagesFromDisk(): {
+    packages: IngestedPackageManifest[];
+    connectors: RagConnector[];
+    routes: RouteDefinition[];
+    chunksCount: number;
+  } {
+    this.state = this.loadState();
+    this.syncLoadedPackageStoresIntoConnectors(true);
+    this.e5EmbeddingCache.clear();
+    this.ensembleManager.clearCaches();
+    this.telemetry.notify();
+    return {
+      packages: this.getIngestedPackages(),
+      connectors: this.state.ragConnectors,
+      routes: this.state.routes,
+      chunksCount: this.getTotalRagChunksCount(),
+    };
+  }
+
   reloadStateIfModified(): boolean {
     try {
       if (!fs.existsSync(this.stateFile)) return false;
@@ -458,6 +592,7 @@ export class UnifiedRouterService {
       }
       if (mtimeMs > this.stateFileMtimeMs) {
         this.state = this.loadState();
+        this.syncLoadedPackageStoresIntoConnectors(false);
         this.stateFileMtimeMs = mtimeMs;
         this.e5EmbeddingCache.clear();
         this.ensembleManager.clearCaches();
@@ -549,6 +684,30 @@ export class UnifiedRouterService {
     return this.libraryKnowledge;
   }
 
+  getTotalRagChunksCount(): number {
+    const pkgChunks = this.packageStores.reduce((sum, s) => sum + s.chunks.length, 0);
+    return this.state.ragChunks.length + pkgChunks;
+  }
+
+  getIngestedPackages(): IngestedPackageManifest[] {
+    this.reloadStateIfModified();
+    return this.packageStores.map((s) => s.manifest);
+  }
+
+  getAvailablePackageArchives(): DiscoveredZipArchive[] {
+    return discoverZipArchives(this.rootDir);
+  }
+
+  getPackageManifest(packageIdOrConnectorId: string): IngestedPackageManifest | null {
+    this.reloadStateIfModified();
+    const store = this.packageStores.find(
+      (s) =>
+        s.manifest.id === packageIdOrConnectorId ||
+        s.manifest.connectorId === packageIdOrConnectorId
+    );
+    return store?.manifest ?? null;
+  }
+
   getTelemetryStateInput(expressPort: number) {
     const activeProfile = this.chatgptAuth.getActiveProfile();
     const loopback = this.chatgptAuth.getLoopbackRuntimeStatus();
@@ -556,6 +715,7 @@ export class UnifiedRouterService {
     const progress = this.progressTracker.getState();
     const activeFocusLabel =
       progress.milestones.find((m) => m.id === progress.currentFocusId)?.label ?? null;
+    const pkgVectorsCount = this.packageStores.reduce((sum, s) => sum + s.chunks.length, 0);
 
     return {
       expressPort,
@@ -572,14 +732,15 @@ export class UnifiedRouterService {
       lastRouteLatencyMs: this.lastRouteLatencyMs,
       encoderModel: this.state.config.encoderModel,
       e5Status: this.e5Status,
-      e5CachedCount: this.e5EmbeddingCache.size,
+      e5CachedCount: this.e5EmbeddingCache.size + pkgVectorsCount,
       lastEmbedLatencyMs: this.lastEmbedLatencyMs,
       loopbackListening: loopback.listening,
       loopbackPort: loopback.port,
       mcpEnabled: this.state.config.mcpEnabled,
       mcpCallCount: this.mcpCallCount,
       ragConnectorCount: this.state.ragConnectors.filter((c) => c.enabled).length,
-      ragChunkCount: this.state.ragChunks.length,
+      ragChunkCount: this.getTotalRagChunksCount(),
+      packageCount: this.packageStores.length,
       lastRagLatencyMs: this.lastRagLatencyMs,
       lastRagError: this.lastRagError,
       ensembleActive: ensemble.slots.some((s) => s.enabled),
@@ -598,7 +759,9 @@ export class UnifiedRouterService {
       config: this.state.config,
       instructions: this.state.instructions,
       ragConnectors: this.state.ragConnectors,
-      ragChunksCount: this.state.ragChunks.length,
+      ragChunksCount: this.getTotalRagChunksCount(),
+      ingestedPackages: this.packageStores.map((s) => s.manifest),
+      availablePackageArchives: this.getAvailablePackageArchives(),
       progressState: this.progressTracker.getState(),
       agentState: this.agentState.getSnapshot(),
     };
@@ -624,10 +787,53 @@ export class UnifiedRouterService {
     return this.state.ragConnectors;
   }
 
+  getWebhookRagChunks(): RagChunk[] {
+    this.reloadStateIfModified();
+    return this.state.ragChunks;
+  }
+
   getRagChunks(connectorId?: string): RagChunk[] {
     this.reloadStateIfModified();
-    if (!connectorId) return this.state.ragChunks;
-    return this.state.ragChunks.filter((c) => c.connectorId === connectorId);
+    const mapPackageChunk = (
+      store: LoadedPackageStore,
+      ch: LoadedPackageStore['chunks'][number]
+    ): RagChunk => ({
+      id: ch.id,
+      connectorId: ch.connectorId,
+      connectorName: ch.connectorName,
+      sourceUrl: `package://${store.manifest.sourceArchive}#${ch.filePath}`,
+      text: ch.text,
+      chunkIndex: ch.chunkIndex,
+      fetchedAt: ch.fetchedAt,
+    });
+
+    if (connectorId) {
+      const pkgStore = this.packageStores.find(
+        (s) => s.manifest.connectorId === connectorId || s.manifest.id === connectorId
+      );
+      if (pkgStore) {
+        return pkgStore.chunks.map((ch) => mapPackageChunk(pkgStore, ch));
+      }
+      return this.state.ragChunks.filter((c) => c.connectorId === connectorId);
+    }
+
+    const allPkgChunks: RagChunk[] = [];
+    for (const store of this.packageStores) {
+      for (const ch of store.chunks) {
+        allPkgChunks.push(mapPackageChunk(store, ch));
+      }
+    }
+    return [...this.state.ragChunks, ...allPkgChunks];
+  }
+
+  getLocalModelInventory(): LocalModelInventoryItem[] {
+    return inspectLocalModelRegistry(this.rootDir);
+  }
+
+  hasLocalLfsModel(modelId: EncoderModelId): boolean {
+    if (modelId === 'local-subword-bm25') return true;
+    const item = inspectLocalModelRegistry(this.rootDir).find((m) => m.id === modelId);
+    return Boolean(item?.installedInLfs);
   }
 
   getProvidersMetadata() {
@@ -637,6 +843,7 @@ export class UnifiedRouterService {
       e5Status: this.e5Status,
       e5CachedCount: this.e5EmbeddingCache.size,
       encoders: ENCODER_PROVIDERS,
+      localModels: this.getLocalModelInventory(),
       ensemble,
       slotStatuses: this.ensembleManager.getSlotStatuses(ensemble),
     };
@@ -716,26 +923,50 @@ export class UnifiedRouterService {
     return [...this.mcpLogs];
   }
 
-  private async getE5Extractor(): Promise<FeatureExtractor> {
-    if (!this.e5PipelinePromise) {
-      this.e5Status = 'loading';
-      this.telemetry.notify();
-      this.e5PipelinePromise = (async () => {
-        const { pipeline } = await import('@huggingface/transformers');
-        const extractor = (await pipeline('feature-extraction', 'Xenova/e5-small-v2', {
-          dtype: 'q8',
-        })) as unknown as FeatureExtractor;
-        this.e5Status = 'ready';
+  private async getOnnxExtractor(
+    modelId: EncoderModelId = 'e5-small-v2',
+    opts?: { allowRemote?: boolean }
+  ): Promise<FeatureExtractor> {
+    const resolvedId: EncoderModelId = MODEL_SPECS[modelId]?.supportsOnnx
+      ? modelId
+      : 'e5-small-v2';
+    let existing = this.onnxExtractors.get(resolvedId);
+    if (!existing) {
+      const target = resolveTransformersModelTarget(resolvedId, this.rootDir);
+      if (resolvedId === 'e5-small-v2') {
+        this.e5Status = 'loading';
         this.telemetry.notify();
+      }
+      existing = (async () => {
+        const { env, pipeline } = await import('@huggingface/transformers');
+        if (target.localFilesOnly) {
+          env.localModelPath = target.modelsRoot;
+        }
+        const allowRemote = opts?.allowRemote ?? true;
+        const extractor = (await pipeline('feature-extraction', target.spec.hfRepo, {
+          dtype: target.dtype,
+          local_files_only: target.localFilesOnly || !allowRemote ? true : false,
+        })) as unknown as FeatureExtractor;
+        if (resolvedId === 'e5-small-v2') {
+          this.e5Status = 'ready';
+          this.telemetry.notify();
+        }
         return extractor;
       })().catch((err) => {
-        this.e5Status = 'error';
-        this.e5PipelinePromise = null;
-        this.telemetry.notify();
+        if (resolvedId === 'e5-small-v2') {
+          this.e5Status = 'error';
+          this.telemetry.notify();
+        }
+        this.onnxExtractors.delete(resolvedId);
         throw err;
       });
+      this.onnxExtractors.set(resolvedId, existing);
     }
-    return this.e5PipelinePromise;
+    return existing;
+  }
+
+  private async getE5Extractor(): Promise<FeatureExtractor> {
+    return this.getOnnxExtractor('e5-small-v2');
   }
 
   private collectPassageDescriptors(routes: RouteDefinition[], includeRagChunks = false) {
@@ -836,26 +1067,34 @@ export class UnifiedRouterService {
       includeRagChunks
     );
 
-    if (encoderModel === 'e5-small-v2') {
+    const onnxCapable =
+      encoderModel === 'e5-small-v2' ||
+      (MODEL_SPECS[encoderModel]?.supportsOnnx && this.hasLocalLfsModel(encoderModel));
+
+    if (onnxCapable) {
       try {
+        const spec = MODEL_SPECS[encoderModel];
+        const useE5Prefix = encoderModel !== 'bge-m3';
         const formattedQueries = queryTexts.map((q) =>
-          formatEmbeddingText(q, 'query', embInstr)
+          useE5Prefix ? formatEmbeddingText(q, 'query', embInstr) : q.trim()
         );
-        const formattedPassages = items.map((i) => i.formatted);
+        const formattedPassages = items.map((i) => (useE5Prefix ? i.formatted : i.raw));
+        const cachePrefix = `${encoderModel}::`;
         const missing = Array.from(
           new Set([...formattedQueries, ...formattedPassages])
-        ).filter((k) => k.length > 0 && !this.e5EmbeddingCache.has(k));
+        ).filter((k) => k.length > 0 && !this.e5EmbeddingCache.has(`${cachePrefix}${k}`));
 
         if (missing.length > 0) {
           const endEmbed = this.telemetry.beginSpan('bridge->embedding');
           try {
-            const ext = await this.getE5Extractor();
-            for (let i = 0; i < missing.length; i += 24) {
-              const batch = missing.slice(i, i + 24);
-              const out = await ext(batch, { pooling: 'mean', normalize: true });
+            const ext = await this.getOnnxExtractor(encoderModel);
+            const pooling = spec.pooling === 'cls' ? 'cls' : 'mean';
+            for (let i = 0; i < missing.length; i += 16) {
+              const batch = missing.slice(i, i + 16);
+              const out = await ext(batch, { pooling, normalize: true });
               const vecs = out.tolist();
               batch.forEach((key, idx) => {
-                this.e5EmbeddingCache.set(key, vecs[idx]);
+                this.e5EmbeddingCache.set(`${cachePrefix}${key}`, vecs[idx]);
               });
             }
             this.lastEmbedLatencyMs = endEmbed('ok');
@@ -865,42 +1104,51 @@ export class UnifiedRouterService {
           }
         }
 
-        const localFallback = createLocalVectorLookup();
+        const localFallback = createLocalVectorLookup(spec.dimensions);
+        const originTag = this.hasLocalLfsModel(encoderModel) ? 'Git LFS ONNX' : 'ONNX';
         endBridge('ok');
         return {
-          encoderUsed: 'intfloat/e5-small-v2 (ONNX 384d)',
+          encoderUsed: `${spec.hfRepo} (${originTag} ${spec.dimensions}d)`,
           lookup: {
             getVector: (text: string) => {
-              const qKey = formatEmbeddingText(text, 'query', embInstr);
-              const pKey = formatEmbeddingText(
-                text,
-                'passage',
-                embInstr,
-                passageOverrideMap.get(text)
-              );
+              const qKey = useE5Prefix ? formatEmbeddingText(text, 'query', embInstr) : text.trim();
+              const pKey = useE5Prefix
+                ? formatEmbeddingText(
+                    text,
+                    'passage',
+                    embInstr,
+                    passageOverrideMap.get(text)
+                  )
+                : text;
               return (
-                this.e5EmbeddingCache.get(qKey) ??
-                this.e5EmbeddingCache.get(pKey) ??
+                this.e5EmbeddingCache.get(`${cachePrefix}${qKey}`) ??
+                this.e5EmbeddingCache.get(`${cachePrefix}${pKey}`) ??
                 localFallback.getVector(text)
               );
             },
             getQueryVector: (text: string) => {
-              const qKey = formatEmbeddingText(text, 'query', embInstr);
-              return this.e5EmbeddingCache.get(qKey) ?? localFallback.getVector(text);
+              const qKey = useE5Prefix ? formatEmbeddingText(text, 'query', embInstr) : text.trim();
+              return (
+                this.e5EmbeddingCache.get(`${cachePrefix}${qKey}`) ?? localFallback.getVector(text)
+              );
             },
             getPassageVector: (text: string) => {
-              const pKey = formatEmbeddingText(
-                text,
-                'passage',
-                embInstr,
-                passageOverrideMap.get(text)
+              const pKey = useE5Prefix
+                ? formatEmbeddingText(
+                    text,
+                    'passage',
+                    embInstr,
+                    passageOverrideMap.get(text)
+                  )
+                : text;
+              return (
+                this.e5EmbeddingCache.get(`${cachePrefix}${pKey}`) ?? localFallback.getVector(text)
               );
-              return this.e5EmbeddingCache.get(pKey) ?? localFallback.getVector(text);
             },
           },
         };
       } catch (err) {
-        console.warn('E5 encoder fallback to local subword:', (err as Error).message);
+        console.warn(`${encoderModel} encoder fallback to local subword:`, (err as Error).message);
       }
     }
 
@@ -924,7 +1172,11 @@ export class UnifiedRouterService {
       encoderUsed:
         encoderModel === 'bge-m3'
           ? 'BAAI/bge-m3 (1024d Projection)'
-          : 'Local Subword + BM25 Hybrid',
+          : encoderModel === 'e5-large-v2'
+            ? 'intfloat/e5-large-v2 (1024d Projection)'
+            : encoderModel === 'e5-base-v2'
+              ? 'intfloat/e5-base-v2 (768d Projection)'
+              : 'Local Subword + BM25 Hybrid',
     };
   }
 
@@ -1103,6 +1355,24 @@ export class UnifiedRouterService {
     }
 
     const localRes = executeLocalProviderFunction(providerId, args, query);
+    if (providerId === 'tool:rea_agents_rag' && opts?.ragMatches && opts.ragMatches.length > 0) {
+      const topMatches = opts.ragMatches.slice(0, 5);
+      localRes.output = {
+        ...(typeof localRes.output === 'object' && localRes.output !== null
+          ? localRes.output
+          : {}),
+        groundedMatchCount: topMatches.length,
+        citations: topMatches.map((m, idx) => ({
+          rank: idx + 1,
+          score: m.score,
+          denseScore: m.denseScore,
+          sparseScore: m.sparseScore,
+          filePath: m.filePath ?? m.sourceUrl,
+          category: m.category ?? 'rag',
+          excerpt: m.text.slice(0, 320),
+        })),
+      };
+    }
     const elapsedMs =
       Math.round((Number(process.hrtime.bigint() - startNs) / 1_000_000) * 100) / 100;
     return {
@@ -1153,6 +1423,237 @@ export class UnifiedRouterService {
     return extractDynamicParametersLocal(query, schema);
   }
 
+  async ingestPackageArchive(opts?: {
+    archivePath?: string;
+    chunkSize?: number;
+    chunkOverlap?: number;
+    encoderModel?: EncoderModelId;
+    filterProfile?: ArchiveFilterProfile;
+    batchSize?: number;
+    maxChars?: number;
+    allowRemoteModelDownload?: boolean;
+    onProgress?: (processedChunks: number, totalChunks: number) => void;
+  }): Promise<{
+    manifest: IngestedPackageManifest;
+    connector: RagConnector;
+  }> {
+    const startNs = process.hrtime.bigint();
+    const endRag = this.telemetry.beginSpan('router->rag_connector');
+    const archivePath =
+      opts?.archivePath?.trim() || 'public/assets/aistudio/rea-rea-agents-6.8.0_a6250980.zip';
+    const filterProfile: ArchiveFilterProfile = opts?.filterProfile ?? 'full-scripts';
+
+    try {
+      const extracted = extractAndChunkZipArchive({
+        archivePath,
+        rootDir: this.rootDir,
+        chunkSize: opts?.chunkSize ?? 1800,
+        chunkOverlap: opts?.chunkOverlap ?? 120,
+        filterProfile,
+      });
+
+      const targetEncoder: EncoderModelId = migrateLegacyEncoder(
+        opts?.encoderModel ?? 'e5-small-v2'
+      );
+      const spec = MODEL_SPECS[targetEncoder] ?? MODEL_SPECS['e5-small-v2'];
+      const dims = spec.dimensions;
+      const vectors = new Float32Array(extracted.chunks.length * dims);
+      const lfsAvailable = this.hasLocalLfsModel(targetEncoder);
+      let encoderLabel = `${spec.hfRepo} (${lfsAvailable ? 'Git LFS ONNX' : spec.supportsOnnx ? 'ONNX' : 'Local'} ${dims}d)`;
+
+      if (spec.supportsOnnx) {
+        try {
+          const endBridge = this.telemetry.beginSpan('router->bridge');
+          const endEmbed = this.telemetry.beginSpan('bridge->embedding');
+          const ext = await this.getOnnxExtractor(targetEncoder, {
+            allowRemote: opts?.allowRemoteModelDownload ?? true,
+          });
+          const embInstr = this.state.instructions.embedding;
+          const batchSize = Math.max(1, Math.min(32, opts?.batchSize ?? 4));
+          const maxCharsCap = opts?.maxChars ?? (targetEncoder === 'bge-m3' ? 2400 : 1100);
+          const pooling = spec.pooling === 'cls' ? 'cls' : 'mean';
+
+          for (let i = 0; i < extracted.chunks.length; i += batchSize) {
+            const batchChunks = extracted.chunks.slice(i, i + batchSize);
+            const batchTexts = batchChunks.map((ch) =>
+              targetEncoder === 'bge-m3'
+                ? ch.text.slice(0, maxCharsCap)
+                : formatEmbeddingText(ch.text, 'passage', {
+                    ...embInstr,
+                    maxChars: maxCharsCap,
+                  })
+            );
+            const out = await ext(batchTexts, { pooling, normalize: true });
+            const vecs = out.tolist();
+            for (let j = 0; j < vecs.length; j++) {
+              const row = vecs[j];
+              const base = (i + j) * dims;
+              for (let d = 0; d < dims; d++) {
+                vectors[base + d] = row[d] ?? 0;
+              }
+              normalizeVectorInPlace(vectors, base, dims);
+            }
+            opts?.onProgress?.(
+              Math.min(extracted.chunks.length, i + batchChunks.length),
+              extracted.chunks.length
+            );
+            if ((i / batchSize) % 25 === 0) {
+              await new Promise((resolve) => setTimeout(resolve, 0));
+            }
+          }
+          this.lastEmbedLatencyMs = endEmbed('ok');
+          endBridge('ok');
+        } catch (err) {
+          console.warn(
+            `Package ingestion ${targetEncoder} ONNX failed, falling back to deterministic ${dims}d vector:`,
+            (err as Error).message
+          );
+          encoderLabel = `${targetEncoder} (local-${dims}d-fallback)`;
+          for (let i = 0; i < extracted.chunks.length; i++) {
+            const vec = computeLocalDenseVector(extracted.chunks[i].text, dims);
+            const base = i * dims;
+            for (let d = 0; d < dims; d++) vectors[base + d] = vec[d] ?? 0;
+          }
+        }
+      } else {
+        for (let i = 0; i < extracted.chunks.length; i++) {
+          const vec = computeLocalDenseVector(extracted.chunks[i].text, dims);
+          const base = i * dims;
+          for (let d = 0; d < dims; d++) vectors[base + d] = vec[d] ?? 0;
+        }
+      }
+
+      const latencyMs =
+        Math.round((Number(process.hrtime.bigint() - startNs) / 1_000_000) * 100) / 100;
+
+      const manifest = savePackageVectorStore({
+        packagesDir: this.packagesDir,
+        manifest: {
+          id: extracted.packageId,
+          packageName: extracted.packageName,
+          version: extracted.version,
+          sourceArchive: extracted.sourceArchive,
+          connectorId: extracted.connectorId,
+          connectorName: extracted.connectorName,
+          encoderModel: encoderLabel,
+          filterProfile,
+          dimensions: dims,
+          chunkCount: extracted.chunks.length,
+          fileCount: extracted.fileCount,
+          totalChars: extracted.totalChars,
+          categories: extracted.categories,
+          ingestedAt: new Date().toISOString(),
+          latencyMs,
+        },
+        chunks: extracted.chunks,
+        vectors,
+      });
+
+      this.syncLoadedPackageStoresIntoConnectors(false);
+      this.saveState();
+      this.lastRagLatencyMs = latencyMs;
+      this.lastRagError = null;
+      endRag('ok');
+      this.telemetry.notify();
+
+      const connector = this.state.ragConnectors.find((c) => c.id === manifest.connectorId)!;
+      return { manifest, connector };
+    } catch (err) {
+      this.lastRagError = (err as Error).message;
+      endRag('error');
+      throw err;
+    }
+  }
+
+  private async resolvePackageQueryVector(
+    query: string,
+    store: LoadedPackageStore,
+    config: RouterConfig,
+    existingLookup?: VectorLookup
+  ): Promise<number[] | null> {
+    if (config.mode === 'sparse') return null;
+
+    const targetDims = store.manifest.dimensions;
+    const storeEncLabel = store.manifest.encoderModel.toLowerCase();
+
+    if (existingLookup) {
+      const candidate = existingLookup.getQueryVector
+        ? existingLookup.getQueryVector(query)
+        : existingLookup.getVector(query);
+      if (candidate.length === targetDims) {
+        return candidate;
+      }
+    }
+
+    if (targetDims === 384) {
+      const { lookup } = await this.buildVectorLookup([query], [], 'e5-small-v2', false);
+      return lookup.getQueryVector ? lookup.getQueryVector(query) : lookup.getVector(query);
+    }
+
+    if (targetDims === 768 && this.hasLocalLfsModel('e5-base-v2')) {
+      const { lookup } = await this.buildVectorLookup([query], [], 'e5-base-v2', false);
+      return lookup.getQueryVector ? lookup.getQueryVector(query) : lookup.getVector(query);
+    }
+
+    if (targetDims === 1024) {
+      const preferredModel: EncoderModelId = storeEncLabel.includes('e5-large')
+        ? 'e5-large-v2'
+        : 'bge-m3';
+      if (this.hasLocalLfsModel(preferredModel)) {
+        const { lookup } = await this.buildVectorLookup([query], [], preferredModel, false);
+        return lookup.getQueryVector ? lookup.getQueryVector(query) : lookup.getVector(query);
+      }
+    }
+
+    const fallback = createLocalVectorLookup(targetDims);
+    return fallback.getVector(query);
+  }
+
+  private async scoreAllAllowedRagSources(opts: {
+    query: string;
+    allowedConnectorIds: Set<string>;
+    config: RouterConfig;
+    lookup: VectorLookup;
+    topK: number;
+    e5QueryLookup?: VectorLookup;
+  }): Promise<RagRetrievalMatch[]> {
+    const candidateChunks = this.state.ragChunks.filter((ch) =>
+      opts.allowedConnectorIds.has(ch.connectorId)
+    );
+    const webhookMatches =
+      candidateChunks.length > 0
+        ? scoreRagChunks(opts.query, candidateChunks, opts.config, opts.lookup, {
+            topK: opts.topK,
+          })
+        : [];
+
+    const activePkgStores = this.packageStores.filter((s) =>
+      opts.allowedConnectorIds.has(s.manifest.connectorId)
+    );
+
+    const packageMatches: RagRetrievalMatch[] = [];
+    for (const store of activePkgStores) {
+      const preferredLookup =
+        store.manifest.dimensions === 384 && opts.e5QueryLookup
+          ? opts.e5QueryLookup
+          : opts.lookup;
+      const qVec = await this.resolvePackageQueryVector(
+        opts.query,
+        store,
+        opts.config,
+        preferredLookup
+      );
+      const hits = scorePackageVectorStore(opts.query, store, opts.config, qVec, {
+        topK: opts.topK,
+      });
+      packageMatches.push(...hits);
+    }
+
+    return [...webhookMatches, ...packageMatches]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, opts.topK);
+  }
+
   async syncRagConnector(connectorId: string): Promise<{
     connector: RagConnector;
     chunkCount: number;
@@ -1164,6 +1665,16 @@ export class UnifiedRouterService {
     }
 
     const connector = this.state.ragConnectors[idx];
+    if (connector.url.startsWith('package://')) {
+      const archiveRel = connector.url.slice('package://'.length);
+      const res = await this.ingestPackageArchive({ archivePath: archiveRel });
+      return {
+        connector: res.connector,
+        chunkCount: res.manifest.chunkCount,
+        latencyMs: res.manifest.latencyMs,
+      };
+    }
+
     const endRag = this.telemetry.beginSpan('router->rag_connector');
 
     try {
@@ -1231,22 +1742,31 @@ export class UnifiedRouterService {
     });
 
     const allowedIds = new Set(enabledConnectors.map((c) => c.id));
-    const candidateChunks = this.state.ragChunks.filter((ch) => allowedIds.has(ch.connectorId));
+    const hasWebhookChunks = this.state.ragChunks.some((ch) => allowedIds.has(ch.connectorId));
 
     const { lookup, encoderUsed } =
       this.state.config.mode === 'sparse'
         ? { lookup: createLocalVectorLookup(), encoderUsed: 'Sparse BM25 / Lexical' }
-        : await this.buildVectorLookup([query], [], this.state.config.encoderModel, true);
+        : await this.buildVectorLookup(
+            [query],
+            [],
+            this.state.config.encoderModel,
+            hasWebhookChunks
+          );
 
-    const matches = scoreRagChunks(query, candidateChunks, this.state.config, lookup, {
+    const endRag = this.telemetry.beginSpan('router->rag_connector');
+    const matches = await this.scoreAllAllowedRagSources({
+      query,
+      allowedConnectorIds: allowedIds,
+      config: this.state.config,
+      lookup,
       topK: opts.topK ?? 3,
+      e5QueryLookup: this.state.config.encoderModel === 'e5-small-v2' ? lookup : undefined,
     });
     const latencyMs =
       Math.round((Number(process.hrtime.bigint() - startNs) / 1_000_000) * 100) / 100;
     this.lastRagLatencyMs = latencyMs;
-    if (matches.length > 0) {
-      this.telemetry.recordPulse('router->rag_connector', latencyMs, 'ok');
-    }
+    endRag('ok');
 
     return {
       query,
@@ -1302,6 +1822,7 @@ export class UnifiedRouterService {
         perEncoderBreakdown?: Partial<Record<EmbeddingSlotRole, RouteScoreBreakdown[]>>;
       };
 
+      let e5QueryLookup: VectorLookup | undefined;
       if (useEnsemble) {
         const endEnsemble = this.telemetry.beginSpan('ensemble->router');
         const slotLookups = await Promise.all(
@@ -1322,6 +1843,10 @@ export class UnifiedRouterService {
         lookup =
           slotLookups.find((s) => s.role === 'domain')?.lookup ??
           slotLookups[0].lookup;
+        const e5SlotIdx = enabledEnsembleSlots.findIndex((s) => s.modelId === 'e5-small-v2');
+        if (e5SlotIdx !== -1) {
+          e5QueryLookup = slotLookups[e5SlotIdx]?.lookup;
+        }
         encoderUsed = `3-Slot Ensemble (${ensembleCfg.fusionMode}: ${enabledEnsembleSlots
           .map((s) => `${s.role}=${s.modelId}`)
           .join(', ')})`;
@@ -1337,11 +1862,14 @@ export class UnifiedRouterService {
               );
         lookup = single.lookup;
         encoderUsed = single.encoderUsed;
+        if (activeConfig.encoderModel === 'e5-small-v2' && activeConfig.mode !== 'sparse') {
+          e5QueryLookup = lookup;
+        }
         scored = scoreRoutes(query, this.state.routes, activeConfig, lookup);
       }
 
       let ragMatches: RagRetrievalMatch[] = [];
-      if (useRag && this.state.ragChunks.length > 0) {
+      if (useRag && (this.state.ragChunks.length > 0 || this.packageStores.length > 0)) {
         const matchedRouteId = scored.matchedRoute?.id ?? null;
         const allowedConnectors = new Set(
           this.state.ragConnectors
@@ -1353,12 +1881,16 @@ export class UnifiedRouterService {
             )
             .map((c) => c.id)
         );
-        const scopedChunks = this.state.ragChunks.filter((ch) =>
-          allowedConnectors.has(ch.connectorId)
-        );
-        if (scopedChunks.length > 0) {
+        if (allowedConnectors.size > 0) {
           const endRagLookup = this.telemetry.beginSpan('router->rag_connector');
-          ragMatches = scoreRagChunks(query, scopedChunks, activeConfig, lookup, { topK: 3 });
+          ragMatches = await this.scoreAllAllowedRagSources({
+            query,
+            allowedConnectorIds: allowedConnectors,
+            config: activeConfig,
+            lookup,
+            topK: scored.matchedRoute?.targetModel === 'tool:rea_agents_rag' ? 5 : 3,
+            e5QueryLookup,
+          });
           this.lastRagLatencyMs = endRagLookup('ok');
         }
       }
@@ -1772,16 +2304,21 @@ export class UnifiedRouterService {
       throw err;
     }
     const existing = this.state.ragConnectors[idx];
+    const isPackageConn = existing.url.startsWith('package://');
     const nextUrl = body.url !== undefined ? body.url.trim() : existing.url;
-    const parsed = new URL(nextUrl);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw new Error('Connector URL must begin with http:// or https://');
+    let resolvedUrl = existing.url;
+    if (!isPackageConn) {
+      const parsed = new URL(nextUrl);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error('Connector URL must begin with http:// or https://');
+      }
+      resolvedUrl = parsed.toString();
     }
 
     const updated: RagConnector = {
       ...existing,
       name: body.name !== undefined ? body.name.trim() || existing.name : existing.name,
-      url: parsed.toString(),
+      url: resolvedUrl,
       method: body.method ?? existing.method,
       headers: body.headers ?? existing.headers,
       requestBody: body.requestBody !== undefined ? body.requestBody : existing.requestBody,
@@ -1804,6 +2341,9 @@ export class UnifiedRouterService {
     this.state.ragConnectors = this.state.ragConnectors.filter((c) => c.id !== id);
     if (this.state.ragConnectors.length === before) return false;
     this.state.ragChunks = this.state.ragChunks.filter((ch) => ch.connectorId !== id);
+    if (deletePackageVectorStoreByConnector(this.packagesDir, id)) {
+      this.syncLoadedPackageStoresIntoConnectors(false);
+    }
     this.saveState();
     this.telemetry.notify();
     return true;
@@ -1983,6 +2523,7 @@ export class UnifiedRouterService {
       ragConnectors: structuredClone(SEED_RAG_CONNECTORS),
       ragChunks: [],
     };
+    this.syncLoadedPackageStoresIntoConnectors(false);
     this.e5EmbeddingCache.clear();
     this.ensembleManager.clearCaches();
     void this.progressTracker.setMilestones(structuredClone(SEED_PROJECT_MILESTONES)).then((ps) => {

@@ -13,6 +13,7 @@ import type {
   EnsembleConfig,
   EnsembleFusionMode,
   EnsembleSlotRuntimeStatus,
+  LocalModelInventoryItem,
   ProviderExecutionResult,
   RouterConfig,
 } from '../lib/types';
@@ -20,6 +21,7 @@ import type {
 interface ProvidersViewProps {
   config: RouterConfig;
   slotStatuses?: EnsembleSlotRuntimeStatus[];
+  localModels?: LocalModelInventoryItem[];
   onSelectEncoder: (encoderModel: EncoderModelId) => Promise<void>;
   onUpdateEnsemble: (ensemble: EnsembleConfig) => Promise<void>;
 }
@@ -48,6 +50,7 @@ const FUSION_MODE_OPTIONS: Array<{ value: EnsembleFusionMode; label: string; hin
 export function ProvidersView({
   config,
   slotStatuses = [],
+  localModels = [],
   onSelectEncoder,
   onUpdateEnsemble,
 }: ProvidersViewProps) {
@@ -423,6 +426,82 @@ export function ProvidersView({
             </tbody>
           </table>
         </div>
+
+        {/* Local Git LFS Model Registry (models/) */}
+        {localModels.length > 0 && (
+          <div
+            data-testid="local-lfs-models-panel"
+            className="pt-4 border-t border-slate-200 space-y-3"
+          >
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <div>
+                <h3 className="text-sm font-semibold text-slate-900">
+                  Local Git LFS Model Registry (<code className="font-mono">models/</code>)
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Offline-ready ONNX weights cloned by <code className="font-mono">fetch-embedding-models.yml</code> into Git LFS for runner vectorization.
+                </p>
+              </div>
+              <span className="text-xs font-mono tabular-nums text-slate-600">
+                {localModels.filter((m) => m.installedInLfs).length} / {localModels.length} ready locally
+              </span>
+            </div>
+
+            <div className="overflow-x-auto border border-slate-200 rounded-md">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-50 border-b border-slate-200 text-slate-600">
+                    <th className="py-2 px-3 font-medium">Model / Repo</th>
+                    <th className="py-2 px-3 font-medium">Pooling · Ctx</th>
+                    <th className="py-2 px-3 text-right font-medium">Dims</th>
+                    <th className="py-2 px-3 font-medium">Local Path / ONNX File</th>
+                    <th className="py-2 px-3 text-right font-medium">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200">
+                  {localModels.map((item) => {
+                    const sizeMb =
+                      item.totalBytes > 0
+                        ? `${(item.totalBytes / (1024 * 1024)).toFixed(1)} MB`
+                        : null;
+                    return (
+                      <tr key={item.id} className="hover:bg-slate-50">
+                        <td className="py-2 px-3">
+                          <div className="font-mono font-semibold text-slate-900">{item.id}</div>
+                          <div className="font-mono text-[11px] text-slate-500">{item.hfRepo}</div>
+                        </td>
+                        <td className="py-2 px-3 font-mono text-[11px] text-slate-700 whitespace-nowrap">
+                          {item.pooling} · {item.maxTokens} tok
+                        </td>
+                        <td className="py-2 px-3 text-right font-mono tabular-nums text-slate-800 whitespace-nowrap">
+                          {item.dimensions}d
+                        </td>
+                        <td className="py-2 px-3 font-mono text-[11px] text-slate-600">
+                          <div>{item.localPath}</div>
+                          {item.onnxFile && (
+                            <div className="text-slate-500">
+                              {item.onnxFile}
+                              {sizeMb ? ` · ${sizeMb}` : ''}
+                            </div>
+                          )}
+                        </td>
+                        <td className="py-2 px-3 text-right font-mono text-[11px] whitespace-nowrap">
+                          {item.source === 'deterministic-local' ? (
+                            <span className="text-slate-700 font-medium">Built-in Deterministic</span>
+                          ) : item.installedInLfs ? (
+                            <span className="text-emerald-700 font-semibold">Cloned in Git LFS</span>
+                          ) : (
+                            <span className="text-amber-700 font-medium">Stage 1 Fetch Needed</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
 
         {/* Live Vector Probe */}
         <div className="pt-4 border-t border-slate-200 space-y-3">

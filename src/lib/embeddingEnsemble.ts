@@ -79,6 +79,8 @@ export function createDefaultLocalEnsembleRunner(
 ): EmbeddingEnsembleRunner {
   const defaultDims: Record<EncoderModelId, number> = {
     'e5-small-v2': 384,
+    'e5-base-v2': 768,
+    'e5-large-v2': 1024,
     'local-subword-bm25': 256,
     'bge-m3': 1024,
   };

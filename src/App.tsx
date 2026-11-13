@@ -35,7 +35,9 @@ import {
 import type {
   AgentStateSnapshot,
   AggregationStrategy,
+  ArchiveFilterProfile,
   ChatGptSessionState,
+  DiscoveredZipArchive,
   EncoderModelId,
   EnsembleConfig,
   EnsembleSlotRuntimeStatus,
@@ -43,7 +45,9 @@ import type {
   EvalReport,
   FitReport,
   FunctionParameter,
+  IngestedPackageManifest,
   LibraryKnowledgeState,
+  LocalModelInventoryItem,
   ProjectMilestone,
   ProjectProgressState,
   RagConnector,
@@ -92,6 +96,8 @@ export default function App() {
   );
   const [ragConnectors, setRagConnectors] = useState<RagConnector[]>([]);
   const [ragChunksCount, setRagChunksCount] = useState<number>(0);
+  const [ingestedPackages, setIngestedPackages] = useState<IngestedPackageManifest[]>([]);
+  const [availablePackageArchives, setAvailablePackageArchives] = useState<DiscoveredZipArchive[]>([]);
   const [libraryKnowledge, setLibraryKnowledge] = useState<LibraryKnowledgeState>(
     DEFAULT_LIBRARY_KNOWLEDGE
   );
@@ -116,6 +122,7 @@ export default function App() {
   const [telemetryStreamConnected, setTelemetryStreamConnected] = useState(false);
   const [probingTelemetry, setProbingTelemetry] = useState(false);
   const [slotStatuses, setSlotStatuses] = useState<EnsembleSlotRuntimeStatus[]>([]);
+  const [localModels, setLocalModels] = useState<LocalModelInventoryItem[]>([]);
   const [progressState, setProgressState] = useState<ProjectProgressState>(() => ({
     sessionId: 'sess-init',
     milestones: structuredClone(SEED_PROJECT_MILESTONES),
@@ -159,8 +166,10 @@ export default function App() {
       if (res.ok) {
         const data = (await res.json()) as {
           slotStatuses?: EnsembleSlotRuntimeStatus[];
+          localModels?: LocalModelInventoryItem[];
         };
         if (data.slotStatuses) setSlotStatuses(data.slotStatuses);
+        if (data.localModels) setLocalModels(data.localModels);
       }
     } catch {
       // Non-blocking
@@ -205,9 +214,16 @@ export default function App() {
         const data = (await res.json()) as {
           connectors: RagConnector[];
           chunks: unknown[];
+          chunksCount?: number;
+          ingestedPackages?: IngestedPackageManifest[];
+          availableArchives?: DiscoveredZipArchive[];
         };
         setRagConnectors(data.connectors);
-        setRagChunksCount(data.chunks.length);
+        setRagChunksCount(
+          typeof data.chunksCount === 'number' ? data.chunksCount : data.chunks.length
+        );
+        if (data.ingestedPackages) setIngestedPackages(data.ingestedPackages);
+        if (data.availableArchives) setAvailablePackageArchives(data.availableArchives);
       }
     } catch {
       // Non-blocking
@@ -227,6 +243,8 @@ export default function App() {
         instructions?: SystemInstructionsConfig;
         ragConnectors?: RagConnector[];
         ragChunksCount?: number;
+        ingestedPackages?: IngestedPackageManifest[];
+        availablePackageArchives?: DiscoveredZipArchive[];
         progressState?: ProjectProgressState;
         agentState?: AgentStateSnapshot;
       };
@@ -236,6 +254,8 @@ export default function App() {
       if (data.instructions) setInstructions(data.instructions);
       if (data.ragConnectors) setRagConnectors(data.ragConnectors);
       if (typeof data.ragChunksCount === 'number') setRagChunksCount(data.ragChunksCount);
+      if (data.ingestedPackages) setIngestedPackages(data.ingestedPackages);
+      if (data.availablePackageArchives) setAvailablePackageArchives(data.availablePackageArchives);
       if (data.progressState) setProgressState(data.progressState);
       if (data.agentState) setAgentState(data.agentState);
       void refreshProviderStatuses();
@@ -514,6 +534,46 @@ export default function App() {
     }
   };
 
+  const handleIngestPackageArchive = async (
+    archivePath?: string,
+    filterProfile: ArchiveFilterProfile = 'full-scripts',
+    encoderModel?: EncoderModelId
+  ) => {
+    const res = await fetch('/api/rag/packages/ingest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ archivePath, filterProfile, encoderModel }),
+    });
+    const data = (await res.json()) as { error?: string };
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to ingest and vectorize package archive');
+    }
+    await refreshRagState();
+    await loadWorkspace();
+  };
+
+  const handleReloadPackagesFromDisk = async () => {
+    const res = await fetch('/api/rag/packages/reload', { method: 'POST' });
+    const data = (await res.json()) as {
+      packages?: IngestedPackageManifest[];
+      connectors?: RagConnector[];
+      routes?: RouteDefinition[];
+      chunksCount?: number;
+      availableArchives?: DiscoveredZipArchive[];
+      localModels?: LocalModelInventoryItem[];
+      error?: string;
+    };
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to reload package stores from disk');
+    }
+    if (data.packages) setIngestedPackages(data.packages);
+    if (data.connectors) setRagConnectors(data.connectors);
+    if (data.routes) setRoutes(data.routes);
+    if (typeof data.chunksCount === 'number') setRagChunksCount(data.chunksCount);
+    if (data.availableArchives) setAvailablePackageArchives(data.availableArchives);
+    if (data.localModels) setLocalModels(data.localModels);
+  };
+
   const handleSaveRoute = async (payload: {
     id?: string;
     name: string;
@@ -754,8 +814,10 @@ export default function App() {
             className="w-full px-2.5 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
           >
             <option value="e5-small-v2">intfloat/e5-small-v2</option>
-            <option value="local-subword-bm25">subword-256d-bm25</option>
+            <option value="e5-base-v2">intfloat/e5-base-v2</option>
+            <option value="e5-large-v2">intfloat/e5-large-v2</option>
             <option value="bge-m3">BAAI/bge-m3</option>
+            <option value="local-subword-bm25">subword-256d-bm25</option>
           </select>
         </div>
 
@@ -952,12 +1014,17 @@ export default function App() {
                   probingTelemetry={probingTelemetry}
                   ragConnectors={ragConnectors}
                   ragChunksCount={ragChunksCount}
+                  ingestedPackages={ingestedPackages}
+                  availablePackageArchives={availablePackageArchives}
+                  localModels={localModels}
                   onProbeHealth={handleProbeHealth}
                   onRunRoute={runRouteQuery}
                   onCreateRagConnector={handleCreateRagConnector}
                   onSyncRagConnector={handleSyncRagConnector}
                   onToggleRagConnector={handleToggleRagConnector}
                   onDeleteRagConnector={handleDeleteRagConnector}
+                  onIngestPackageArchive={handleIngestPackageArchive}
+                  onReloadPackagesFromDisk={handleReloadPackagesFromDisk}
                   onNavigateToRoutes={() => setActiveTab('routes')}
                   onNavigateToInstructions={() => setActiveTab('instructions')}
                   onOpenChatGptAuth={() => setAuthModalOpen(true)}
@@ -1033,6 +1100,7 @@ export default function App() {
                 <ProvidersView
                   config={config}
                   slotStatuses={slotStatuses}
+                  localModels={localModels}
                   onSelectEncoder={(encoderModel) =>
                     handleUpdateConfig({ encoderModel, calibrateThresholds: true })
                   }

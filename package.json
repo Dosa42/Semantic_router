@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "tsx server.ts",
     "mcp": "tsx mcp-server.ts",
+    "vectorize": "tsx scripts/vectorize-runner.ts",
+    "fetch-models": "node scripts/fetch-models-lfs.mjs",
     "start": "node server.ts",
     "build": "vite build",
     "preview": "vite preview",

@@ -1,0 +1,119 @@
+name: 2. External Chunking & Vectorizing Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_path:
+        description: Archive (.zip) or directory path to chunk and vectorize
+        required: true
+        default: 'public/assets/aistudio/rea-rea-agents-6.8.0_a6250980.zip'
+        type: string
+      model_id:
+        description: Embedding model (prefers cloned Git LFS models/ directory offline)
+        required: true
+        default: 'bge-m3'
+        type: choice
+        options:
+          - bge-m3
+          - e5-large-v2
+          - e5-base-v2
+          - e5-small-v2
+          - local-subword-bm25
+      filter_profile:
+        description: Archive filter preset (full-scripts indexes scripts/ + docs/ + bridge/ + core-src)
+        required: true
+        default: 'full-scripts'
+        type: choice
+        options:
+          - full-scripts
+          - core-docs
+      chunk_size:
+        description: Maximum characters per chunk
+        required: true
+        default: '1800'
+        type: string
+      chunk_overlap:
+        description: Character overlap between adjacent chunks
+        required: true
+        default: '120'
+        type: string
+      batch_size:
+        description: ONNX inference batch size
+        required: true
+        default: '8'
+        type: string
+      smoke_query:
+        description: Verification query executed after vectorization
+        required: true
+        default: 'How does REA Agents expose Frida instrumentation and Ghidra bridges over MCP?'
+        type: string
+      auto_commit:
+        description: Auto-commit generated data/packages vectors & router-state back to repo
+        required: true
+        default: true
+        type: boolean
+  push:
+    paths:
+      - 'public/assets/aistudio/*.zip'
+      - 'models/registry.json'
+
+concurrency:
+  group: vectorize-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  vectorize-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with Git LFS models
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 1
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run external chunking & vectorization runner
+        run: |
+          SOURCE_PATH="${{ inputs.source_path || 'public/assets/aistudio/rea-rea-agents-6.8.0_a6250980.zip' }}"
+          MODEL_ID="${{ inputs.model_id || 'bge-m3' }}"
+          PROFILE="${{ inputs.filter_profile || 'full-scripts' }}"
+          CHUNK_SIZE="${{ inputs.chunk_size || '1800' }}"
+          CHUNK_OVERLAP="${{ inputs.chunk_overlap || '120' }}"
+          BATCH_SIZE="${{ inputs.batch_size || '8' }}"
+          SMOKE_QUERY="${{ inputs.smoke_query || 'How does REA Agents expose Frida instrumentation and Ghidra bridges over MCP?' }}"
+
+          ./node_modules/.bin/tsx scripts/vectorize-runner.ts \
+            --source "$SOURCE_PATH" \
+            --model "$MODEL_ID" \
+            --profile "$PROFILE" \
+            --chunk-size "$CHUNK_SIZE" \
+            --chunk-overlap "$CHUNK_OVERLAP" \
+            --batch-size "$BATCH_SIZE" \
+            --smoke-query "$SMOKE_QUERY"
+
+      - name: Run package ingestor unit tests
+        run: ./node_modules/.bin/tsx --test src/lib/packageIngestor.test.ts
+
+      - name: Auto-commit Float32 vectors & router state back to repo
+        if: github.event_name == 'push' || inputs.auto_commit == true
+        run: |
+          git config user.name "semantic-router-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/packages/ data/router-state.json
+          if git diff --cached --quiet; then
+            echo "Vector store unchanged; skipping commit."
+            exit 0
+          fi
+          git commit -m "chore(rag): update vectorized Float32 package store [skip ci]"
+          git push

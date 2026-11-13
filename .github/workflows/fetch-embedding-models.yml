@@ -1,0 +1,83 @@
+name: 1. Fetch & Clone Embedding Models (Git LFS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: Comma-separated Hugging Face ONNX repos to clone into models/
+        required: true
+        default: 'Xenova/bge-m3,Xenova/e5-base-v2,Xenova/e5-large-v2'
+        type: string
+      quantization:
+        description: ONNX quantization preset (q8 recommended for Git LFS quota & CPU speed)
+        required: true
+        default: 'q8'
+        type: choice
+        options:
+          - q8
+          - fp16
+          - fp32
+      run_smoke_test:
+        description: Verify local offline ONNX inference before committing to Git LFS
+        required: true
+        default: true
+        type: boolean
+      commit_push:
+        description: Commit and push cloned Git LFS models back to the repository
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  clone-models-lfs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with Git LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+          fetch-depth: 1
+
+      - name: Initialize Git LFS tracking
+        run: |
+          git lfs install
+          git lfs track "models/**/*.onnx" "models/**/*.onnx_data" "models/**/*.safetensors" "models/**/*.bin" "models/**/*.model"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Clone & verify ONNX models into models/
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          SMOKE_FLAG=""
+          if [ "${{ inputs.run_smoke_test }}" != "true" ]; then
+            SMOKE_FLAG="--no-smoke"
+          fi
+          node scripts/fetch-models-lfs.mjs \
+            --models "${{ inputs.models }}" \
+            --dtype "${{ inputs.quantization }}" \
+            $SMOKE_FLAG
+
+      - name: Commit & push cloned LFS weights to repo
+        if: inputs.commit_push == true
+        run: |
+          git config user.name "semantic-router-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add .gitattributes models/
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git lfs ls-files
+          git commit -m "chore(models): clone ONNX candidates (${{ inputs.quantization }}) into Git LFS [skip ci]"
+          git push

@@ -801,9 +801,11 @@ test('fuseEnsembleScores, runParallelEmbeddings, and scoreRoutesEnsemble handle 
     0
   );
 
-  // Providers registry includes bge-m3 and defaultRole on all 3 encoders
-  assert.equal(ENCODER_PROVIDERS.length, 3);
+  // Providers registry includes 5 encoders (e5-small/base/large-v2, subword-bm25, bge-m3) with defaultRole
+  assert.equal(ENCODER_PROVIDERS.length, 5);
   assert.equal(ENCODER_PROVIDERS.find((e) => e.id === 'e5-small-v2')?.defaultRole, 'intent');
+  assert.equal(ENCODER_PROVIDERS.find((e) => e.id === 'e5-base-v2')?.dimensions, 768);
+  assert.equal(ENCODER_PROVIDERS.find((e) => e.id === 'e5-large-v2')?.dimensions, 1024);
   assert.equal(ENCODER_PROVIDERS.find((e) => e.id === 'local-subword-bm25')?.defaultRole, 'domain');
   assert.equal(ENCODER_PROVIDERS.find((e) => e.id === 'bge-m3')?.defaultRole, 'state');
 

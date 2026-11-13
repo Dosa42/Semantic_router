@@ -2,19 +2,27 @@ import React, { useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
+  Check,
   CheckCircle2,
   ChevronDown,
   ChevronUp,
   Clock,
+  Copy,
   Database,
   Play,
   Plus,
   RefreshCw,
   RotateCcw,
+  Terminal,
   Trash2,
 } from 'lucide-react';
 import { SAMPLE_PLAYGROUND_PROMPTS } from '../lib/seedData';
 import type {
+  ArchiveFilterProfile,
+  DiscoveredZipArchive,
+  EncoderModelId,
+  IngestedPackageManifest,
+  LocalModelInventoryItem,
   RagConnector,
   RagParserMode,
   RouteDecisionResult,
@@ -35,6 +43,9 @@ interface PlaygroundViewProps {
   probingTelemetry: boolean;
   ragConnectors: RagConnector[];
   ragChunksCount: number;
+  ingestedPackages: IngestedPackageManifest[];
+  availablePackageArchives: DiscoveredZipArchive[];
+  localModels: LocalModelInventoryItem[];
   onProbeHealth: () => Promise<void>;
   onRunRoute: (query: string, useRag?: boolean) => Promise<void>;
   onCreateRagConnector: (payload: {
@@ -48,6 +59,12 @@ interface PlaygroundViewProps {
   onSyncRagConnector: (id: string) => Promise<void>;
   onToggleRagConnector: (connector: RagConnector) => Promise<void>;
   onDeleteRagConnector: (id: string) => Promise<void>;
+  onIngestPackageArchive: (
+    archivePath?: string,
+    filterProfile?: ArchiveFilterProfile,
+    encoderModel?: EncoderModelId
+  ) => Promise<void>;
+  onReloadPackagesFromDisk: () => Promise<void>;
   onNavigateToRoutes: () => void;
   onNavigateToInstructions: () => void;
   onOpenChatGptAuth: () => void;
@@ -64,12 +81,17 @@ export function PlaygroundView({
   probingTelemetry,
   ragConnectors,
   ragChunksCount,
+  ingestedPackages,
+  availablePackageArchives,
+  localModels,
   onProbeHealth,
   onRunRoute,
   onCreateRagConnector,
   onSyncRagConnector,
   onToggleRagConnector,
   onDeleteRagConnector,
+  onIngestPackageArchive,
+  onReloadPackagesFromDisk,
   onNavigateToRoutes,
   onNavigateToInstructions,
   onOpenChatGptAuth,
@@ -87,7 +109,18 @@ export function PlaygroundView({
   const [connRequestBody, setConnRequestBody] = useState('');
   const [connError, setConnError] = useState<string | null>(null);
   const [syncingId, setSyncingId] = useState<string | null>(null);
+  const [ingestingArchive, setIngestingArchive] = useState<string | null>(null);
+  const [reloadingDisk, setReloadingDisk] = useState(false);
   const [creatingConn, setCreatingConn] = useState(false);
+
+  const [filterProfile, setFilterProfile] = useState<ArchiveFilterProfile>('full-scripts');
+  const [runnerSource, setRunnerSource] = useState<string>(
+    availablePackageArchives[0]?.relativePath ||
+      'public/assets/aistudio/rea-rea-agents-6.8.0_a6250980.zip'
+  );
+  const [runnerModel, setRunnerModel] = useState<EncoderModelId>('bge-m3');
+  const [runnerChunkSize, setRunnerChunkSize] = useState<string>('1800');
+  const [copiedCmdId, setCopiedCmdId] = useState<string | null>(null);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -173,6 +206,49 @@ export function PlaygroundView({
       setSyncingId(null);
     }
   };
+
+  const handleIngestArchive = async (archivePath?: string) => {
+    const key = archivePath ?? 'default';
+    setIngestingArchive(key);
+    setConnError(null);
+    try {
+      await onIngestPackageArchive(archivePath, filterProfile);
+    } catch (err) {
+      setConnError((err as Error).message || 'Package vectorization failed');
+    } finally {
+      setIngestingArchive(null);
+    }
+  };
+
+  const handleReloadDisk = async () => {
+    setReloadingDisk(true);
+    setConnError(null);
+    try {
+      await onReloadPackagesFromDisk();
+    } catch (err) {
+      setConnError((err as Error).message || 'Reload from disk failed');
+    } finally {
+      setReloadingDisk(false);
+    }
+  };
+
+  const handleCopyCommand = (id: string, cmd: string) => {
+    void navigator.clipboard?.writeText(cmd);
+    setCopiedCmdId(id);
+    window.setTimeout(() => setCopiedCmdId((prev) => (prev === id ? null : prev)), 1500);
+  };
+
+  const effectiveSource =
+    runnerSource ||
+    availablePackageArchives[0]?.relativePath ||
+    'public/assets/aistudio/rea-rea-agents-6.8.0_a6250980.zip';
+  const stage1WorkflowCmd =
+    'gh workflow run fetch-embedding-models.yml -f models="Xenova/bge-m3,Xenova/e5-base-v2,Xenova/e5-large-v2" -f dtype="q8"';
+  const stage2WorkflowCmd = `gh workflow run vectorize-sources.yml -f source_path="${effectiveSource}" -f model_id="${runnerModel}" -f filter_profile="${filterProfile}" -f chunk_size="${runnerChunkSize}" -f auto_commit=true`;
+  const localCliCmd = `npm run vectorize -- --source ${effectiveSource} --model ${runnerModel} --profile ${filterProfile} --chunk-size ${runnerChunkSize}`;
+  const clonedLfsCount = localModels.filter(
+    (m) => m.id !== 'local-subword-bm25' && m.installedInLfs
+  ).length;
 
   return (
     <div className="grid grid-cols-1 xl:grid-cols-[410px_minmax(0,1fr)] gap-6 items-start">
@@ -417,6 +493,250 @@ export function PlaygroundView({
                   </tbody>
                 </table>
               </div>
+
+              {(ingestedPackages.length > 0 || availablePackageArchives.length > 0) && (
+                <div
+                  data-testid="ingested-packages-panel"
+                  className="bg-slate-50 border border-slate-200 rounded-md p-4 space-y-4"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <h3 className="text-xs font-semibold text-slate-900">
+                        Vectorized ZIP Package Stores ({ingestedPackages.length} persisted)
+                      </h3>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        Float32 embeddings persisted under <code className="font-mono">data/packages/</code> and served on HTTP :3000 + MCP stdio.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      <div
+                        role="group"
+                        aria-label="Archive filter profile"
+                        className="inline-flex p-0.5 bg-slate-200/80 rounded border border-slate-300 text-[11px]"
+                      >
+                        <button
+                          type="button"
+                          onClick={() => setFilterProfile('full-scripts')}
+                          className={`px-2 py-1 rounded font-medium whitespace-nowrap ${
+                            filterProfile === 'full-scripts'
+                              ? 'bg-white text-slate-900 shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          Include scripts/
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setFilterProfile('core-docs')}
+                          className={`px-2 py-1 rounded font-medium whitespace-nowrap ${
+                            filterProfile === 'core-docs'
+                              ? 'bg-white text-slate-900 shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          Docs &amp; Core Only
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={reloadingDisk}
+                        onClick={() => void handleReloadDisk()}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 rounded disabled:opacity-50 whitespace-nowrap shrink-0"
+                      >
+                        <RefreshCw className={`w-3 h-3 ${reloadingDisk ? 'animate-spin' : ''}`} />
+                        {reloadingDisk ? 'Reloading...' : 'Reload Disk Stores'}
+                      </button>
+                    </div>
+                  </div>
+
+                  {ingestedPackages.length > 0 && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                      {ingestedPackages.map((pkg) => {
+                        const categorySummary = Object.entries(pkg.categories ?? {})
+                          .sort((a, b) => b[1] - a[1])
+                          .map(([cat, count]) => `${cat}: ${count}`)
+                          .join(' · ');
+                        return (
+                          <div
+                            key={pkg.id}
+                            className="p-3 bg-white border border-slate-200 rounded text-xs space-y-1.5"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-mono font-semibold text-slate-900">
+                                {pkg.packageName}@{pkg.version}
+                              </span>
+                              <span className="font-mono tabular-nums text-[11px] text-emerald-700 font-medium">
+                                {pkg.chunkCount} chunks · {pkg.dimensions}d
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-slate-600 font-mono truncate">
+                              {pkg.encoderModel} · {pkg.fileCount} files · {pkg.filterProfile ?? 'full-scripts'}
+                            </div>
+                            {categorySummary && (
+                              <div className="text-[11px] text-slate-600 font-mono tabular-nums leading-relaxed">
+                                {categorySummary}
+                              </div>
+                            )}
+                            <div className="text-[11px] text-slate-500 font-mono truncate">
+                              {pkg.storageFiles.vectors}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {availablePackageArchives.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-[11px] font-medium text-slate-600">
+                        Archives in assets:
+                      </span>
+                      {availablePackageArchives.map((arch) => {
+                        const already = ingestedPackages.some(
+                          (p) => p.sourceArchive === arch.relativePath
+                        );
+                        const busy = ingestingArchive === arch.relativePath;
+                        return (
+                          <button
+                            key={arch.relativePath}
+                            type="button"
+                            disabled={busy}
+                            onClick={() => void handleIngestArchive(arch.relativePath)}
+                            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-mono font-medium text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 rounded disabled:opacity-50 whitespace-nowrap shrink-0"
+                          >
+                            <RefreshCw className={`w-3 h-3 ${busy ? 'animate-spin' : ''}`} />
+                            {already ? 'Re-Vectorize' : 'Ingest & Vectorize'} {arch.fileName}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* External Chunking & GitHub Workflow Runner */}
+                  <div
+                    data-testid="external-runner-panel"
+                    className="pt-3 border-t border-slate-200 space-y-3"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <h4 className="text-xs font-semibold text-slate-900 flex items-center gap-1.5">
+                          <Terminal className="w-3.5 h-3.5 text-slate-600" />
+                          External Chunking &amp; GitHub Workflow Runner
+                        </h4>
+                        <p className="text-[11px] text-slate-500 mt-0.5">
+                          Stage 1 clones ONNX candidates into Git LFS (<code className="font-mono">models/</code>); Stage 2 chunks, vectorizes offline, and auto-commits <code className="font-mono">data/packages/</code>.
+                        </p>
+                      </div>
+                      <span className="text-[11px] font-mono tabular-nums text-slate-600">
+                        {clonedLfsCount} / 4 ONNX models in Git LFS
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      <div>
+                        <label
+                          htmlFor="runner-source-input"
+                          className="block text-[11px] font-medium text-slate-700 mb-1"
+                        >
+                          Source Archive / Dir
+                        </label>
+                        <input
+                          id="runner-source-input"
+                          type="text"
+                          value={runnerSource}
+                          onChange={(e) => setRunnerSource(e.target.value)}
+                          className="w-full px-2 py-1 text-[11px] font-mono bg-white border border-slate-300 rounded"
+                        />
+                      </div>
+                      <div>
+                        <label
+                          htmlFor="runner-model-select"
+                          className="block text-[11px] font-medium text-slate-700 mb-1"
+                        >
+                          LFS Model Candidate
+                        </label>
+                        <select
+                          id="runner-model-select"
+                          value={runnerModel}
+                          onChange={(e) => setRunnerModel(e.target.value as EncoderModelId)}
+                          className="w-full px-2 py-1 text-[11px] font-mono bg-white border border-slate-300 rounded"
+                        >
+                          <option value="bge-m3">Xenova/bge-m3 (1024d CLS)</option>
+                          <option value="e5-large-v2">Xenova/e5-large-v2 (1024d Mean)</option>
+                          <option value="e5-base-v2">Xenova/e5-base-v2 (768d Mean)</option>
+                          <option value="e5-small-v2">Xenova/e5-small-v2 (384d Mean)</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label
+                          htmlFor="runner-chunk-size"
+                          className="block text-[11px] font-medium text-slate-700 mb-1"
+                        >
+                          Chunk Size (chars)
+                        </label>
+                        <select
+                          id="runner-chunk-size"
+                          value={runnerChunkSize}
+                          onChange={(e) => setRunnerChunkSize(e.target.value)}
+                          className="w-full px-2 py-1 text-[11px] font-mono bg-white border border-slate-300 rounded"
+                        >
+                          <option value="1200">1200 chars</option>
+                          <option value="1800">1800 chars (default)</option>
+                          <option value="2400">2400 chars</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      {[
+                        {
+                          id: 'stage1',
+                          label: 'Stage 1 · One-time Git LFS Model Clone',
+                          cmd: stage1WorkflowCmd,
+                        },
+                        {
+                          id: 'stage2',
+                          label: 'Stage 2 · GitHub Action Vectorize & Auto-Commit',
+                          cmd: stage2WorkflowCmd,
+                        },
+                        {
+                          id: 'cli',
+                          label: 'Local CLI · Run Standalone Runner',
+                          cmd: localCliCmd,
+                        },
+                      ].map((item) => (
+                        <div
+                          key={item.id}
+                          className="flex items-center justify-between gap-2 px-2.5 py-1.5 bg-white border border-slate-200 rounded text-[11px]"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <span className="font-medium text-slate-600 mr-2">{item.label}:</span>
+                            <code className="font-mono text-slate-800 break-all">{item.cmd}</code>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleCopyCommand(item.id, item.cmd)}
+                            aria-label={`Copy ${item.label} command`}
+                            className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-slate-600 hover:text-slate-900 bg-slate-100 hover:bg-slate-200 rounded shrink-0 whitespace-nowrap"
+                          >
+                            {copiedCmdId === item.id ? (
+                              <>
+                                <Check className="w-3 h-3 text-emerald-700" />
+                                Copied
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3 h-3" />
+                                Copy
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
 
               <form
                 onSubmit={handleAddConnector}
@@ -682,16 +1002,23 @@ export function PlaygroundView({
                       key={m.chunkId}
                       className="p-3 bg-white border border-slate-200 rounded-md text-xs space-y-1"
                     >
-                      <div className="flex items-center justify-between gap-2 text-slate-600">
-                        <span className="font-semibold text-slate-900">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-slate-600">
+                        <span className="font-semibold text-slate-900 truncate">
                           [{idx + 1}] {m.connectorName}
+                          {m.filePath ? (
+                            <span className="ml-2 font-mono font-normal text-[11px] text-blue-700">
+                              {m.filePath}
+                            </span>
+                          ) : null}
                         </span>
-                        <span className="font-mono tabular-nums text-emerald-700">
+                        <span className="font-mono tabular-nums text-emerald-700 shrink-0">
                           Score {m.score.toFixed(3)} (D {m.denseScore.toFixed(2)} / S{' '}
                           {m.sparseScore.toFixed(2)})
                         </span>
                       </div>
-                      <p className="text-slate-700 leading-relaxed">{m.text}</p>
+                      <p className="text-slate-700 leading-relaxed whitespace-pre-wrap break-words">
+                        {m.text}
+                      </p>
                     </div>
                   ))}
                 </div>

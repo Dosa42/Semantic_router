@@ -285,6 +285,23 @@
       "lastLatencyMs": 24.9,
       "lastError": null,
       "chunkCount": 4
+    },
+    {
+      "id": "rag-conn-rea-agents-6.8.0",
+      "name": "rea-agents@6.8.0 Knowledge Base",
+      "url": "package://public/assets/aistudio/rea-rea-agents-6.8.0_a6250980.zip",
+      "method": "GET",
+      "headers": {},
+      "parserMode": "auto",
+      "boundRouteIds": [],
+      "chunkSize": 1200,
+      "chunkOverlap": 100,
+      "enabled": true,
+      "lastSyncedAt": "2026-11-13T21:47:31.864Z",
+      "lastStatus": "ok",
+      "lastLatencyMs": 273438.89,
+      "lastError": null,
+      "chunkCount": 3930
     }
   ],
   "ragChunks": [
@@ -4464,7 +4481,7 @@
       {
         "milestoneId": "ms-intent-triage",
         "label": "Intent Classification & Safety Gate",
-        "score": 0.0572,
+        "score": 0.1133,
         "completed": false
       },
       {
@@ -4477,44 +4494,44 @@
       {
         "milestoneId": "ms-billing-resolution",
         "label": "Billing & Order Refund Extraction",
-        "score": 0.0044,
+        "score": 0.0527,
         "completed": false
       },
       {
         "milestoneId": "ms-rag-grounding",
         "label": "TRINITY / Webhook RAG Grounding",
-        "score": 0.0363,
+        "score": 0.1,
         "completed": false
       }
     ],
-    "overallProgress": 0.2745,
+    "overallProgress": 0.3165,
     "currentFocusId": "ms-intent-triage",
-    "lastUpdatedAt": "2026-11-13T20:31:59.483Z",
-    "lastOutputPreview": "What is the current local time in Tokyo right now? {\"location\":\"Tokyo\",\"timezone\":\"Asia/Tokyo\",\"localTime\":\"Nov 14, 2026, 5:31:59 AM GMT+9\",\"isoUtc\":\"2026-11-13T20:31:59.474Z\"}",
+    "lastUpdatedAt": "2026-11-13T21:48:19.719Z",
+    "lastOutputPreview": "How does REA Agents expose Frida instrumentation and Ghidra bridges over MCP? {\"action\":\"passthrough\",\"message\":\"No specialized route cleared its threshold. Forwarded to default ge",
     "lastStateVecPreview": [
       0,
-      0.0958,
+      0,
+      0,
+      0,
+      0,
+      0,
+      -0.0712,
+      0,
+      0,
+      0,
+      0,
+      0,
+      -0.0488,
+      0,
+      -0.0264,
       0,
       0,
       0,
       0,
       0,
       0,
-      0,
-      0,
-      0,
-      0,
-      0.2161,
-      0,
-      0,
-      0.0319,
-      0,
-      0,
-      0,
-      0.0589,
-      0,
-      0.0638,
-      0,
+      0.0935,
+      -0.0264,
       0
     ]
   },

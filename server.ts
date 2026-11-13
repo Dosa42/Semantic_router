@@ -15,6 +15,7 @@ import { UnifiedRouterService } from './src/lib/routerService.ts';
 import { DEFAULT_SYSTEM_INSTRUCTIONS } from './src/lib/seedData.ts';
 import { TelemetryCollector } from './src/lib/telemetry.ts';
 import type {
+  ArchiveFilterProfile,
   EncoderModelId,
   LibraryKnowledgeState,
   OpenAiFlowMode,
@@ -625,7 +626,10 @@ async function startServer() {
   app.get('/api/rag/connectors', (_req, res) => {
     res.json({
       connectors: service.getRagConnectors(),
-      chunks: service.getRagChunks(),
+      chunks: service.getWebhookRagChunks(),
+      chunksCount: service.getTotalRagChunksCount(),
+      ingestedPackages: service.getIngestedPackages(),
+      availableArchives: service.getAvailablePackageArchives(),
     });
   });
 
@@ -672,7 +676,12 @@ async function startServer() {
   app.get('/api/rag/chunks', (req, res) => {
     const connectorId =
       typeof req.query.connectorId === 'string' ? req.query.connectorId : undefined;
-    res.json({ chunks: service.getRagChunks(connectorId) });
+    const chunks = service.getRagChunks(connectorId);
+    const limit = typeof req.query.limit === 'string' ? Number(req.query.limit) : 0;
+    res.json({
+      totalCount: chunks.length,
+      chunks: limit > 0 ? chunks.slice(0, limit) : chunks,
+    });
   });
 
   app.post('/api/rag/query', async (req, res) => {
@@ -688,6 +697,92 @@ async function startServer() {
         connectorIds: body.connectorIds,
         routeId: body.routeId,
         topK: body.topK,
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Vectorized ZIP Package RAG API routes ---
+
+  app.get('/api/rag/packages', (_req, res) => {
+    res.json({
+      packages: service.getIngestedPackages(),
+      availableArchives: service.getAvailablePackageArchives(),
+      localModels: service.getLocalModelInventory(),
+    });
+  });
+
+  app.post('/api/rag/packages/reload', (_req, res) => {
+    const reloaded = service.reloadPackagesFromDisk();
+    res.json({
+      ...reloaded,
+      availableArchives: service.getAvailablePackageArchives(),
+      localModels: service.getLocalModelInventory(),
+    });
+  });
+
+  app.post('/api/rag/packages/ingest', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        archivePath?: string;
+        chunkSize?: number;
+        chunkOverlap?: number;
+        encoderModel?: EncoderModelId;
+        filterProfile?: ArchiveFilterProfile;
+        batchSize?: number;
+        maxChars?: number;
+      };
+      const result = await service.ingestPackageArchive({
+        archivePath: body.archivePath,
+        chunkSize: body.chunkSize,
+        chunkOverlap: body.chunkOverlap,
+        encoderModel: body.encoderModel,
+        filterProfile: body.filterProfile,
+        batchSize: body.batchSize,
+        maxChars: body.maxChars,
+      });
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/rag/packages/:id/manifest', (req, res) => {
+    const manifest = service.getPackageManifest(req.params.id);
+    if (!manifest) {
+      res.status(404).json({ error: 'Ingested package manifest not found.' });
+      return;
+    }
+    res.json({ manifest });
+  });
+
+  app.post('/api/rag/packages/query', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        query?: string;
+        packageId?: string;
+        connectorId?: string;
+        topK?: number;
+      };
+      const packages = service.getIngestedPackages();
+      let connectorIds: string[] | undefined;
+      if (body.connectorId) {
+        connectorIds = [body.connectorId];
+      } else if (body.packageId) {
+        const match = packages.find(
+          (p) => p.id === body.packageId || p.packageName === body.packageId
+        );
+        connectorIds = match ? [match.connectorId] : [body.packageId];
+      } else if (packages.length > 0) {
+        connectorIds = packages.map((p) => p.connectorId);
+      }
+
+      const result = await service.queryRag({
+        query: body.query ?? '',
+        connectorIds,
+        topK: body.topK ?? 5,
       });
       res.json(result);
     } catch (err) {

@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "updatedAt": "2026-11-13T00:00:00.000Z",
+  "lfsTrackedDirectory": "models",
+  "note": "Populated by .github/workflows/fetch-embedding-models.yml (one-time Git LFS clone).",
+  "models": []
+}

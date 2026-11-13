@@ -231,7 +231,7 @@ export const MCP_JSONRPC_PRESETS: Array<{
   },
   {
     label: 'tools/call · rag_retrieve',
-    description: 'Search synced RAG connector chunks directly',
+    description: 'Search synced RAG connector & REA Agents chunks directly',
     payload: {
       jsonrpc: '2.0',
       id: 4,
@@ -239,9 +239,22 @@ export const MCP_JSONRPC_PRESETS: Array<{
       params: {
         name: 'rag_retrieve',
         arguments: {
-          query: 'How does hybrid BM25 and e5-small-v2 scoring work?',
+          query: 'How does REA Agents expose Frida instrumentation over MCP?',
           topK: 3,
         },
+      },
+    },
+  },
+  {
+    label: 'tools/call · list_ingested_packages',
+    description: 'Inspect vectorized ZIP package knowledge stores (rea-agents@6.8.0)',
+    payload: {
+      jsonrpc: '2.0',
+      id: 8,
+      method: 'tools/call',
+      params: {
+        name: 'list_ingested_packages',
+        arguments: {},
       },
     },
   },

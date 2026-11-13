@@ -1,9 +1,30 @@
 export type RouteType = 'static' | 'dynamic';
 export type RoutingMode = 'hybrid' | 'dense' | 'sparse';
 export type AggregationStrategy = 'max' | 'mean' | 'top_k_mean';
-export type EncoderModelId = 'e5-small-v2' | 'local-subword-bm25' | 'bge-m3';
+export type EncoderModelId =
+  | 'e5-small-v2'
+  | 'e5-base-v2'
+  | 'e5-large-v2'
+  | 'local-subword-bm25'
+  | 'bge-m3';
+export type ArchiveFilterProfile = 'full-scripts' | 'core-docs';
 export type EmbeddingSlotRole = 'intent' | 'domain' | 'state';
 export type EnsembleFusionMode = 'weighted_sum' | 'max' | 'cascade';
+
+export interface LocalModelInventoryItem {
+  id: EncoderModelId;
+  hfRepo: string;
+  localPath: string;
+  installedInLfs: boolean;
+  onnxFile: string | null;
+  quantization: string | null;
+  dimensions: number;
+  pooling: 'mean' | 'cls' | 'hybrid';
+  maxTokens: number;
+  totalBytes: number;
+  source: 'git-lfs-local' | 'huggingface-cache-or-remote' | 'deterministic-local';
+  clonedAt: string | null;
+}
 
 export interface EmbeddingSlotConfig {
   modelId: EncoderModelId;
@@ -169,10 +190,53 @@ export interface RagRetrievalMatch {
   connectorId: string;
   connectorName: string;
   sourceUrl: string;
+  filePath?: string;
+  category?: string;
   text: string;
   score: number;
   denseScore: number;
   sparseScore: number;
+}
+
+export interface IngestedPackageManifest {
+  id: string;
+  packageName: string;
+  version: string;
+  sourceArchive: string;
+  connectorId: string;
+  connectorName: string;
+  encoderModel: string;
+  filterProfile?: ArchiveFilterProfile;
+  dimensions: number;
+  chunkCount: number;
+  fileCount: number;
+  totalChars: number;
+  categories: Record<string, number>;
+  storageFiles: {
+    manifest: string;
+    chunks: string;
+    vectors: string;
+  };
+  ingestedAt: string;
+  latencyMs: number;
+}
+
+export interface IngestedPackageChunk {
+  id: string;
+  packageId: string;
+  connectorId: string;
+  connectorName: string;
+  filePath: string;
+  category: string;
+  text: string;
+  chunkIndex: number;
+  fetchedAt: string;
+}
+
+export interface DiscoveredZipArchive {
+  fileName: string;
+  relativePath: string;
+  bytes: number;
 }
 
 export interface RagQueryResult {
@@ -484,6 +548,7 @@ export interface TelemetrySnapshot {
   mcpCallCount: number;
   ragConnectorCount: number;
   ragChunkCount: number;
+  packageCount?: number;
   ensembleActive?: boolean;
   progressOverall?: number;
   activeFlowEdge: string | null;

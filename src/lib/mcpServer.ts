@@ -3,7 +3,11 @@ import { PassThrough } from 'node:stream';
 import { resolveChatGptSystemPrompt } from './instructions.ts';
 import type { UnifiedRouterService } from './routerService.ts';
 import type { TelemetryCollector } from './telemetry.ts';
-import type { McpStdioLogEntry } from './types.ts';
+import type {
+  ArchiveFilterProfile,
+  EncoderModelId,
+  McpStdioLogEntry,
+} from './types.ts';
 
 export interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -49,20 +53,61 @@ export const MCP_TOOL_DEFINITIONS = [
   {
     name: 'rag_retrieve',
     description:
-      'Retrieve top-K hybrid semantic + sparse chunks from synced external webhook / URL RAG connectors.',
+      'Retrieve top-K hybrid semantic + sparse chunks from synced external webhook / URL RAG connectors and vectorized ZIP packages.',
     inputSchema: {
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Search query to match against RAG chunks' },
         topK: { type: 'number', description: 'Maximum chunks to return (default 3)' },
+        connectorIds: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional array of RAG connector IDs (e.g. ["rag-conn-rea-agents-6.8.0"])',
+        },
       },
       required: ['query'],
     },
   },
   {
+    name: 'list_ingested_packages',
+    description:
+      'List all vectorized ZIP package knowledge stores (e.g., rea-agents@6.8.0), their chunk/vector counts, and discovered .zip archives.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'ingest_package_rag',
+    description:
+      'Extract, chunk, and vectorize a ZIP package archive or directory (default public/assets/aistudio/rea-rea-agents-6.8.0_a6250980.zip) into persistent Float32 storage.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        archivePath: {
+          type: 'string',
+          description: 'Workspace-relative path to the .zip archive or folder to ingest',
+        },
+        filterProfile: {
+          type: 'string',
+          enum: ['full-scripts', 'core-docs'],
+          description: 'Filter profile ("full-scripts" includes scripts/, "core-docs" skips scripts/)',
+        },
+        encoderModel: {
+          type: 'string',
+          enum: ['e5-small-v2', 'e5-base-v2', 'e5-large-v2', 'bge-m3', 'local-subword-bm25'],
+          description: 'Encoder model ID (prefers local Git LFS ONNX models when cloned under models/)',
+        },
+        chunkSize: { type: 'number', description: 'Target chunk size in characters (default 1800)' },
+        chunkOverlap: { type: 'number', description: 'Chunk overlap in characters (default 120)' },
+        batchSize: { type: 'number', description: 'ONNX inference batch size (default 4)' },
+      },
+    },
+  },
+  {
     name: 'sync_rag_connector',
     description:
-      'Fetch and index an external webhook or URL RAG connector into the unified vector store.',
+      'Fetch and index an external webhook, URL, or package:// RAG connector into the unified vector store.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -377,7 +422,48 @@ export class McpStdioServer {
       if (toolName === 'rag_retrieve') {
         const query = String(args.query ?? '').trim();
         const topK = typeof args.topK === 'number' ? args.topK : 3;
-        const result = await this.opts.service.queryRag({ query, topK });
+        const connectorIds = Array.isArray(args.connectorIds)
+          ? (args.connectorIds as string[])
+          : undefined;
+        const result = await this.opts.service.queryRag({ query, topK, connectorIds });
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+        };
+      }
+
+      if (toolName === 'list_ingested_packages') {
+        const packages = this.opts.service.getIngestedPackages();
+        const availableArchives = this.opts.service.getAvailablePackageArchives();
+        const localModels = this.opts.service.getLocalModelInventory();
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify({ packages, availableArchives, localModels }, null, 2),
+            },
+          ],
+          structuredContent: { packages, availableArchives, localModels },
+        };
+      }
+
+      if (toolName === 'ingest_package_rag') {
+        const filterProfile =
+          args.filterProfile === 'core-docs' || args.filterProfile === 'full-scripts'
+            ? (args.filterProfile as ArchiveFilterProfile)
+            : undefined;
+        const encoderModel =
+          typeof args.encoderModel === 'string'
+            ? (args.encoderModel as EncoderModelId)
+            : undefined;
+        const result = await this.opts.service.ingestPackageArchive({
+          archivePath: typeof args.archivePath === 'string' ? args.archivePath : undefined,
+          filterProfile,
+          encoderModel,
+          chunkSize: typeof args.chunkSize === 'number' ? args.chunkSize : undefined,
+          chunkOverlap: typeof args.chunkOverlap === 'number' ? args.chunkOverlap : undefined,
+          batchSize: typeof args.batchSize === 'number' ? args.batchSize : undefined,
+        });
         return {
           content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
           structuredContent: result,
@@ -540,6 +626,11 @@ export class McpStdioServer {
             mimeType: 'application/json',
           },
           {
+            uri: 'rag://packages',
+            name: 'Vectorized ZIP Package Stores',
+            mimeType: 'application/json',
+          },
+          {
             uri: 'trinity://health',
             name: 'TRINITY :7700 Core Health & UAGL Stats',
             mimeType: 'application/json',
@@ -560,6 +651,12 @@ export class McpStdioServer {
       else if (uri === 'router://instructions') data = this.opts.service.getInstructions();
       else if (uri === 'rag://connectors') data = this.opts.service.getRagConnectors();
       else if (uri === 'rag://chunks') data = this.opts.service.getRagChunks();
+      else if (uri === 'rag://packages') {
+        data = {
+          packages: this.opts.service.getIngestedPackages(),
+          availableArchives: this.opts.service.getAvailablePackageArchives(),
+        };
+      }
       else if (uri === 'trinity://health') data = await this.opts.service.getTrinityHealth();
       else if (uri === 'progress://state') {
         data = {
