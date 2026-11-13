@@ -19,6 +19,17 @@ import {
   resolveTimezone,
 } from './providers';
 import {
+  formatEmbeddingText,
+  normalizeEmbeddingInput,
+  resolveChatGptSystemPrompt,
+} from './instructions';
+import {
+  chunkText,
+  extractContentFromResponse,
+  scoreRagChunks,
+} from './ragEngine';
+import {
+  ChatGptAuthManager,
   buildAuthorizePreviewPayload,
   computeS256Challenge,
   serializeAuthorizeParams,
@@ -29,8 +40,22 @@ import {
   computeSubsystemSignals,
   sanitizeTelemetryPayload,
 } from './telemetry';
-import { DEFAULT_ROUTER_CONFIG, SEED_EVAL_CASES, SEED_ROUTES } from './seedData';
-import type { RouteDefinition, RouterConfig } from './types';
+import { UnifiedRouterService } from './routerService';
+import { invokeSingleMcpJsonRpc } from './mcpServer';
+import {
+  DEFAULT_LIBRARY_KNOWLEDGE,
+  buildLibraryKnowledgeMarkdown,
+} from './architectureBlueprints';
+import {
+  DEFAULT_ROUTER_CONFIG,
+  DEFAULT_SYSTEM_INSTRUCTIONS,
+  SEED_EVAL_CASES,
+  SEED_ROUTES,
+} from './seedData';
+import type { RagChunk, RouteDefinition, RouterConfig } from './types';
+import os from 'node:os';
+import path from 'node:path';
+import fs from 'node:fs';
 
 const LOCAL_TEST_CONFIG: RouterConfig = {
   ...DEFAULT_ROUTER_CONFIG,
@@ -353,3 +378,205 @@ test('telemetry redacts sensitive tokens, classifies endpoints, and computes 3 s
   assert.equal(snap.activeFlowEdge, 'semantic-router-rag');
   assert.equal(snap.endpoints.find((e) => e.id === 'POST /api/route')?.hits, 1);
 });
+
+test('dual system instructions format embedding inputs and resolve ChatGPT overrides + RAG citations', () => {
+  const normalized = normalizeEmbeddingInput('  Hello   WORLD  ', {
+    ...DEFAULT_SYSTEM_INSTRUCTIONS.embedding,
+    lowercaseInput: true,
+    stripExtraWhitespace: true,
+    maxChars: 8,
+  });
+  assert.equal(normalized, 'hello wo');
+
+  const queryVecText = formatEmbeddingText(
+    'Rank top customers',
+    'query',
+    {
+      ...DEFAULT_SYSTEM_INSTRUCTIONS.embedding,
+      taskInstruction: 'Instruct: Match SQL.',
+    },
+    { embeddingContextPrefix: '[Domain: Warehouse]' }
+  );
+  assert.equal(
+    queryVecText,
+    'query: Instruct: Match SQL. [Domain: Warehouse] Rank top customers'
+  );
+
+  const sqlRoute = SEED_ROUTES.find((r) => r.name === 'sql_analytics')!;
+  const resolved = resolveChatGptSystemPrompt(
+    {
+      ...DEFAULT_SYSTEM_INSTRUCTIONS.chatgpt,
+      enforceCitations: true,
+      conciseMode: true,
+    },
+    {
+      route: sqlRoute,
+      ragMatches: [
+        {
+          chunkId: 'c1',
+          connectorId: 'conn-1',
+          connectorName: 'Docs Webhook',
+          sourceUrl: 'https://example.com/docs',
+          text: 'Use window functions for cumulative totals.',
+          score: 0.91,
+          denseScore: 0.92,
+          sparseScore: 0.88,
+        },
+      ],
+    }
+  );
+  assert.ok(resolved.includes(sqlRoute.instructionOverrides!.chatgptSystemInstruction!));
+  assert.ok(resolved.includes('[1] (Docs Webhook'));
+  assert.ok(resolved.includes('cite source numbers like [1]'));
+});
+
+test('ragEngine parses JSON/HTML, chunks with overlap, and scores hybrid retrieval matches', () => {
+  const htmlExtracted = extractContentFromResponse(
+    '<html><body><script>bad()</script><h1>Index Guide</h1><p>Use composite B-Tree indexes.</p></body></html>',
+    'text/html',
+    'auto'
+  );
+  assert.ok(htmlExtracted.includes('Index Guide'));
+  assert.ok(!htmlExtracted.includes('bad()'));
+
+  const jsonExtracted = extractContentFromResponse(
+    JSON.stringify({ documents: [{ title: 'MCP', content: 'Stdio JSON-RPC transport.' }] }),
+    'application/json',
+    'json',
+    'documents'
+  );
+  assert.ok(jsonExtracted.includes('# MCP'));
+  assert.ok(jsonExtracted.includes('Stdio JSON-RPC transport.'));
+
+  const chunksText = chunkText('Paragraph one is short.\n\nParagraph two has PostgreSQL details.', 120, 10);
+  assert.ok(chunksText.length >= 1);
+
+  const ragChunks: RagChunk[] = [
+    {
+      id: 'c1',
+      connectorId: 'demo',
+      connectorName: 'Demo',
+      sourceUrl: 'http://127.0.0.1:3000/api/rag/demo-webhook',
+      text: 'PostgreSQL composite B-Tree index ordering for analytical window functions',
+      chunkIndex: 0,
+      fetchedAt: new Date().toISOString(),
+    },
+    {
+      id: 'c2',
+      connectorId: 'demo',
+      connectorName: 'Demo',
+      sourceUrl: 'http://127.0.0.1:3000/api/rag/demo-webhook',
+      text: 'Sourdough fermentation temperature and baking hydration schedule',
+      chunkIndex: 1,
+      fetchedAt: new Date().toISOString(),
+    },
+  ];
+  const lookup = createLocalVectorLookup();
+  const matches = scoreRagChunks(
+    'PostgreSQL window functions index ordering',
+    ragChunks,
+    LOCAL_TEST_CONFIG,
+    lookup,
+    { topK: 2, minScore: 0.05 }
+  );
+  assert.equal(matches[0]?.chunkId, 'c1');
+  assert.ok((matches[0]?.score ?? 0) > (matches[1]?.score ?? 0));
+});
+
+test('TelemetryCollector beginSpan tracks activeCount and exact durationMs across edges', () => {
+  const collector = new TelemetryCollector();
+  const endSpan = collector.beginSpan('bridge->embedding');
+  const during = collector.getSnapshot();
+  const bridgeEdgeDuring = during.edges.find((e) => e.id === 'bridge->embedding');
+  assert.equal(bridgeEdgeDuring?.activeCount, 1);
+
+  const duration = endSpan('ok');
+  assert.ok(duration >= 0);
+  const after = collector.getSnapshot();
+  const bridgeEdgeAfter = after.edges.find((e) => e.id === 'bridge->embedding');
+  assert.equal(bridgeEdgeAfter?.activeCount, 0);
+  assert.equal(bridgeEdgeAfter?.lastStatus, 'ok');
+  assert.equal(bridgeEdgeAfter?.hitCount, 1);
+  assert.ok(bridgeEdgeAfter?.lastDurationMs !== null);
+});
+
+test('McpStdioServer processes JSON-RPC initialize, tools/list, and route_prompt over real stdin/stdout PassThrough streams', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sr-mcp-test-'));
+  try {
+    const telemetry = new TelemetryCollector();
+    const auth = new ChatGptAuthManager(tmpDir);
+    const service = new UnifiedRouterService(tmpDir, auth, telemetry);
+    service.updateConfig({
+      encoderModel: 'local-subword-bm25',
+      calibrateThresholds: true,
+    });
+
+    const initRes = await invokeSingleMcpJsonRpc(service, telemetry, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {},
+    });
+    assert.equal(initRes.response.id, 1);
+    assert.ok((initRes.response.result as { serverInfo: { name: string } }).serverInfo.name === 'semantic-router-rag-mcp');
+
+    const toolsRes = await invokeSingleMcpJsonRpc(service, telemetry, {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/list',
+      params: {},
+    });
+    const tools = (toolsRes.response.result as { tools: Array<{ name: string }> }).tools;
+    assert.ok(tools.some((t) => t.name === 'route_prompt'));
+    assert.ok(tools.some((t) => t.name === 'rag_retrieve'));
+
+    const routeCall = await invokeSingleMcpJsonRpc(service, telemetry, {
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: {
+        name: 'route_prompt',
+        arguments: {
+          query: 'What is the current local time in Tokyo?',
+          useRag: false,
+          executeProvider: false,
+        },
+      },
+    });
+    const structured = (routeCall.response.result as { structuredContent: { matchedRoute: string | null } }).structuredContent;
+    assert.equal(structured.matchedRoute, 'get_time');
+
+    const snap = telemetry.getSnapshot();
+    const mcpEdge = snap.edges.find((e) => e.id === 'mcp->router');
+    assert.ok((mcpEdge?.hitCount ?? 0) >= 3);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Architecture Library Knowledge persists dual Mermaid blueprints and exports Markdown', () => {
+  const md = buildLibraryKnowledgeMarkdown(DEFAULT_LIBRARY_KNOWLEDGE);
+  assert.ok(md.includes('```mermaid'));
+  assert.ok(md.includes('UnifiedRouterService'));
+  assert.ok(md.includes('TrinityRAGServer'));
+  assert.ok(md.includes('FAISSIndex'));
+  assert.equal(DEFAULT_LIBRARY_KNOWLEDGE.blueprints.length, 2);
+  assert.ok(DEFAULT_LIBRARY_KNOWLEDGE.comparisonMatrix.length >= 6);
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sr-knowledge-test-'));
+  try {
+    const telemetry = new TelemetryCollector();
+    const auth = new ChatGptAuthManager(tmpDir);
+    const service = new UnifiedRouterService(tmpDir, auth, telemetry);
+    service.updateLibraryKnowledge({ notes: 'Custom note for TRINITY bridge' });
+
+    const reloaded = new UnifiedRouterService(tmpDir, auth, telemetry);
+    assert.equal(reloaded.getLibraryKnowledge().notes, 'Custom note for TRINITY bridge');
+
+    const reset = reloaded.resetLibraryKnowledge();
+    assert.equal(reset.notes, DEFAULT_LIBRARY_KNOWLEDGE.notes);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+

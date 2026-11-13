@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
 import express from 'express';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -9,97 +8,23 @@ import {
   buildPopupCompletionHtml,
   buildPopupErrorHtml,
 } from './src/lib/chatgptAuth.ts';
-import {
-  ENCODER_PROVIDERS,
-  ROUTE_PROVIDER_FUNCTIONS,
-  executeLocalProviderFunction,
-} from './src/lib/providers.ts';
+import { invokeSingleMcpJsonRpc } from './src/lib/mcpServer.ts';
+import { ROUTE_PROVIDER_FUNCTIONS } from './src/lib/providers.ts';
+import { UnifiedRouterService } from './src/lib/routerService.ts';
+import { DEFAULT_SYSTEM_INSTRUCTIONS } from './src/lib/seedData.ts';
 import { TelemetryCollector } from './src/lib/telemetry.ts';
-import {
-  createLocalVectorLookup,
-  evaluateDataset,
-  extractDynamicParametersLocal,
-  optimizeRouteThresholds,
-  scoreRoutes,
-  type VectorLookup,
-} from './src/lib/routerEngine.ts';
-import { DEFAULT_ROUTER_CONFIG, SEED_EVAL_CASES, SEED_ROUTES } from './src/lib/seedData.ts';
 import type {
   EncoderModelId,
-  EvalCase,
-  ExtractedFunctionCall,
-  FunctionSchema,
+  LibraryKnowledgeState,
   OpenAiFlowMode,
-  ProviderExecutionResult,
-  RouteDecisionResult,
+  RagConnector,
   RouteDefinition,
   RouterConfig,
+  SystemInstructionsConfig,
 } from './src/lib/types.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DATA_DIR = path.join(__dirname, 'data');
-const STATE_FILE = path.join(DATA_DIR, 'router-state.json');
-
-interface PersistedState {
-  routes: RouteDefinition[];
-  evalCases: EvalCase[];
-  config: RouterConfig;
-}
-
-function migrateLegacyTargetModel(target: string): string {
-  if (target === 'gemini-4-hydrogen') return 'openai:chatgpt-flagship';
-  if (target === 'gemini-3.1-flash-lite') return 'openai:chatgpt-fast';
-  return target;
-}
-
-function migrateLegacyEncoder(enc: string | undefined): EncoderModelId {
-  if (enc === 'local-subword-bm25') return 'local-subword-bm25';
-  return 'e5-small-v2';
-}
-
-function loadState(): PersistedState {
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      const raw = fs.readFileSync(STATE_FILE, 'utf-8');
-      const parsed = JSON.parse(raw) as Partial<PersistedState>;
-      if (Array.isArray(parsed.routes) && Array.isArray(parsed.evalCases) && parsed.config) {
-        const migratedRoutes = parsed.routes.map((r) => ({
-          ...r,
-          targetModel: migrateLegacyTargetModel(r.targetModel),
-        }));
-        const migratedConfig: RouterConfig = {
-          ...DEFAULT_ROUTER_CONFIG,
-          ...parsed.config,
-          encoderModel: migrateLegacyEncoder(parsed.config.encoderModel),
-        };
-        return {
-          routes: migratedRoutes,
-          evalCases: parsed.evalCases,
-          config: migratedConfig,
-        };
-      }
-    }
-  } catch {
-    // Fallback to deterministic seed state
-  }
-  return {
-    routes: structuredClone(SEED_ROUTES),
-    evalCases: structuredClone(SEED_EVAL_CASES),
-    config: { ...DEFAULT_ROUTER_CONFIG },
-  };
-}
-
-function saveState(state: PersistedState): void {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Failed to persist router state:', err);
-  }
-}
 
 function parseCookies(cookieHeader: string | undefined): Record<string, string> {
   const out: Record<string, string> = {};
@@ -119,7 +44,8 @@ function resolveAppOrigin(req: express.Request): string {
   if (envUrl && envUrl !== 'MY_APP_URL') {
     return envUrl;
   }
-  const proto = (req.headers['x-forwarded-proto'] as string)?.split(',')[0] || req.protocol || 'http';
+  const proto =
+    (req.headers['x-forwarded-proto'] as string)?.split(',')[0] || req.protocol || 'http';
   const host = req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000';
   return `${proto}://${host}`;
 }
@@ -138,168 +64,16 @@ function getOrCreateBrowserSessionId(req: express.Request, res: express.Response
   return fresh;
 }
 
-// Local HuggingFace E5 ONNX embedding singleton & cache
-const e5EmbeddingCache = new Map<string, number[]>();
-
-type FeatureExtractor = (
-  texts: string[],
-  options: { pooling: 'mean'; normalize: boolean }
-) => Promise<{ tolist: () => number[][] }>;
-
-let e5PipelinePromise: Promise<FeatureExtractor> | null = null;
-let e5Status: 'idle' | 'loading' | 'ready' | 'error' = 'idle';
-const telemetry = new TelemetryCollector();
-
-async function getE5Extractor(): Promise<FeatureExtractor> {
-  if (!e5PipelinePromise) {
-    e5Status = 'loading';
-    telemetry.notify();
-    e5PipelinePromise = (async () => {
-      const { pipeline } = await import('@huggingface/transformers');
-      const extractor = (await pipeline('feature-extraction', 'Xenova/e5-small-v2', {
-        dtype: 'q8',
-      })) as unknown as FeatureExtractor;
-      e5Status = 'ready';
-      telemetry.notify();
-      return extractor;
-    })().catch((err) => {
-      e5Status = 'error';
-      e5PipelinePromise = null;
-      telemetry.notify();
-      throw err;
-    });
-  }
-  return e5PipelinePromise;
-}
-
-function collectRouteUtterances(routes: RouteDefinition[]): string[] {
-  const texts: string[] = [];
-  for (const r of routes) {
-    if (!r.enabled) continue;
-    for (const u of r.utterances) texts.push(u);
-  }
-  return texts;
-}
-
-async function warmUpE5(routes: RouteDefinition[]): Promise<void> {
-  try {
-    const passages = collectRouteUtterances(routes).map((u) => `passage: ${u.trim()}`);
-    const uniqueMissing = Array.from(new Set(passages)).filter((p) => !e5EmbeddingCache.has(p));
-    if (uniqueMissing.length === 0) return;
-    const ext = await getE5Extractor();
-    for (let i = 0; i < uniqueMissing.length; i += 24) {
-      const batch = uniqueMissing.slice(i, i + 24);
-      const out = await ext(batch, { pooling: 'mean', normalize: true });
-      const vecs = out.tolist();
-      batch.forEach((key, idx) => {
-        e5EmbeddingCache.set(key, vecs[idx]);
-      });
-    }
-    telemetry.notify();
-  } catch (err) {
-    console.warn('E5 warmup failed:', (err as Error).message);
-  }
-}
-
-async function buildVectorLookup(
-  queryTexts: string[],
-  passageTexts: string[],
-  encoderModel: EncoderModelId
-): Promise<{
-  lookup: VectorLookup;
-  encoderUsed: string;
-}> {
-  if (encoderModel === 'e5-small-v2') {
-    try {
-      const ext = await getE5Extractor();
-      const prefixed = Array.from(
-        new Set([
-          ...queryTexts.map((q) => `query: ${q.trim()}`),
-          ...passageTexts.map((p) => `passage: ${p.trim()}`),
-        ])
-      ).filter((k) => k.length > 9 && !e5EmbeddingCache.has(k));
-
-      if (prefixed.length > 0) {
-        for (let i = 0; i < prefixed.length; i += 24) {
-          const batch = prefixed.slice(i, i + 24);
-          const out = await ext(batch, { pooling: 'mean', normalize: true });
-          const vecs = out.tolist();
-          batch.forEach((key, idx) => {
-            e5EmbeddingCache.set(key, vecs[idx]);
-          });
-        }
-      }
-
-      const localFallback = createLocalVectorLookup();
-      return {
-        encoderUsed: 'intfloat/e5-small-v2 (ONNX 384d)',
-        lookup: {
-          getVector(text: string) {
-            return (
-              e5EmbeddingCache.get(`query: ${text.trim()}`) ??
-              e5EmbeddingCache.get(`passage: ${text.trim()}`) ??
-              localFallback.getVector(text)
-            );
-          },
-          getQueryVector(text: string) {
-            return e5EmbeddingCache.get(`query: ${text.trim()}`) ?? localFallback.getVector(text);
-          },
-          getPassageVector(text: string) {
-            return e5EmbeddingCache.get(`passage: ${text.trim()}`) ?? localFallback.getVector(text);
-          },
-        },
-      };
-    } catch (err) {
-      console.warn('E5 encoder fallback to local subword:', (err as Error).message);
-    }
-  }
-
-  return {
-    lookup: createLocalVectorLookup(),
-    encoderUsed: 'Local Subword + BM25 Hybrid',
-  };
-}
-
 async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
+  const telemetry = new TelemetryCollector();
   const chatgptAuth = new ChatGptAuthManager(__dirname);
-  let state = loadState();
-  saveState(state);
+  const service = new UnifiedRouterService(__dirname, chatgptAuth, telemetry);
 
-  let isEvaluatingOrFitting = false;
-  let lastOpenAiError: string | null = null;
-  let lastOpenAiLatencyMs: number | null = null;
-  let lastRouterError: string | null = null;
-  let lastRouteLatencyMs: number | null = null;
-  let lastEmbedLatencyMs: number | null = null;
-
-  telemetry.attachStateProvider(() => {
-    const activeProfile = chatgptAuth.getActiveProfile();
-    const loopback = chatgptAuth.getLoopbackRuntimeStatus();
-    return {
-      expressPort: PORT,
-      chatGptConnected: Boolean(activeProfile?.connected),
-      chatGptSharing: Boolean(activeProfile?.sharing),
-      chatGptEmail: activeProfile?.email ?? activeProfile?.subject ?? null,
-      pendingAuthCount: loopback.pendingOAuthCount + loopback.pendingDeviceCount,
-      lastOpenAiError,
-      lastOpenAiLatencyMs,
-      activeRouteCount: state.routes.filter((r) => r.enabled).length,
-      totalRouteCount: state.routes.length,
-      isEvaluatingOrFitting,
-      lastRouterError,
-      lastRouteLatencyMs,
-      encoderModel: state.config.encoderModel,
-      e5Status,
-      e5CachedCount: e5EmbeddingCache.size,
-      lastEmbedLatencyMs,
-      loopbackListening: loopback.listening,
-      loopbackPort: loopback.port,
-    };
-  });
+  telemetry.attachStateProvider(() => service.getTelemetryStateInput(PORT));
 
   // Live API & OAuth telemetry interceptor (excludes /api/telemetry* to avoid recursion)
   app.use((req, res, next) => {
@@ -313,7 +87,9 @@ async function startServer() {
     }
 
     const startNs = process.hrtime.bigint();
+    const endBrowserEdge = telemetry.beginSpan('browser->express');
     let capturedBody: unknown = null;
+
     const origJson = res.json.bind(res);
     res.json = ((body?: unknown) => {
       capturedBody = body;
@@ -324,9 +100,10 @@ async function startServer() {
     res.send = ((body?: unknown) => {
       if (capturedBody === null) {
         if (typeof body === 'string') {
-          capturedBody = body.startsWith('<!doctype') || body.startsWith('<html')
-            ? { htmlResponse: true, bytes: body.length }
-            : body;
+          capturedBody =
+            body.startsWith('<!doctype') || body.startsWith('<html')
+              ? { htmlResponse: true, bytes: body.length }
+              : body;
         } else {
           capturedBody = body ?? null;
         }
@@ -336,6 +113,7 @@ async function startServer() {
 
     res.on('finish', () => {
       const durationMs = Number(process.hrtime.bigint() - startNs) / 1_000_000;
+      endBrowserEdge(res.statusCode >= 400 ? 'error' : 'ok');
       telemetry.recordHttpEvent({
         method: req.method,
         path: reqPath,
@@ -353,94 +131,6 @@ async function startServer() {
 
     next();
   });
-
-  async function executeProviderFunction(
-    providerId: string,
-    args: Record<string, unknown>,
-    query: string
-  ): Promise<ProviderExecutionResult> {
-    const startNs = process.hrtime.bigint();
-    const isOpenAiLlm =
-      providerId === 'openai:chatgpt-flagship' || providerId === 'openai:chatgpt-fast';
-
-    if (isOpenAiLlm) {
-      const activeProfile = chatgptAuth.getActiveProfile();
-      if (activeProfile && activeProfile.sharing) {
-        try {
-          const pref = providerId === 'openai:chatgpt-fast' ? 'fast' : 'flagship';
-          const result = await chatgptAuth.streamResponses({
-            profileId: activeProfile.profileId,
-            preference: pref,
-            input: query,
-            instructions:
-              'You are a concise backend execution target dispatched by Semantic Router. Reply directly and accurately.',
-            timeoutMs: 12_000,
-          });
-          const elapsedMs = Number(process.hrtime.bigint() - startNs) / 1_000_000;
-          lastOpenAiError = null;
-          lastOpenAiLatencyMs = Math.round(elapsedMs * 100) / 100;
-          return {
-            providerId,
-            providerKind: 'llm',
-            handlerName:
-              pref === 'fast' ? 'executeChatGptFastProvider' : 'executeChatGptFlagshipProvider',
-            latencyMs: lastOpenAiLatencyMs,
-            status: 'ok',
-            output: {
-              model: result.model,
-              account: activeProfile.email ?? activeProfile.subject,
-              responseText: result.text,
-            },
-          };
-        } catch (err) {
-          lastOpenAiError = (err as Error).message;
-          console.warn(`OpenAI Responses execution error (${providerId}):`, (err as Error).message);
-        }
-      }
-    }
-
-    const localRes = executeLocalProviderFunction(providerId, args, query);
-    const elapsedMs = Number(process.hrtime.bigint() - startNs) / 1_000_000;
-    return {
-      ...localRes,
-      latencyMs: Math.round(elapsedMs * 100) / 100,
-    };
-  }
-
-  async function extractDynamicParameters(
-    query: string,
-    schema: FunctionSchema
-  ): Promise<ExtractedFunctionCall> {
-    const activeProfile = chatgptAuth.getActiveProfile();
-    if (activeProfile && activeProfile.sharing) {
-      try {
-        const paramSpec = schema.parameters
-          .map((p) => `${p.name} (${p.type}${p.required ? ', required' : ''}): ${p.description}`)
-          .join('\n');
-        const res = await chatgptAuth.streamResponses({
-          profileId: activeProfile.profileId,
-          preference: 'fast',
-          instructions:
-            'Extract JSON function arguments strictly matching the schema. Return ONLY raw valid JSON object with keys matching parameter names.',
-          input: `Function: ${schema.name}\nDescription: ${schema.description}\nParameters:\n${paramSpec}\n\nUser prompt: ${query}`,
-          timeoutMs: 5000,
-        });
-        const cleanJson = res.text.replace(/^```json\s*|\s*```$/g, '').trim();
-        const parsed = JSON.parse(cleanJson) as Record<
-          string,
-          string | number | boolean | null
-        >;
-        return {
-          name: schema.name,
-          arguments: parsed,
-          extractionMethod: 'openai-chatgpt-plan',
-        };
-      } catch (err) {
-        console.warn('OpenAI parameter extraction fallback:', (err as Error).message);
-      }
-    }
-    return extractDynamicParametersLocal(query, schema);
-  }
 
   // --- Sign in with ChatGPT (OpenAI OAuth2 + PKCE + OIDC) endpoints ---
 
@@ -509,6 +199,9 @@ async function startServer() {
         clientIdOverride,
         useLoopback,
       });
+      if (started.flowMode === 'dynamic_agent') {
+        telemetry.recordPulse('chatgpt->loopback', 1.2, 'ok');
+      }
       res.json(started);
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
@@ -533,6 +226,9 @@ async function startServer() {
         clientIdOverride: body.clientIdOverride ?? null,
         useLoopback: body.useLoopback !== false,
       });
+      if (started.flowMode === 'dynamic_agent') {
+        telemetry.recordPulse('chatgpt->loopback', 1.2, 'ok');
+      }
       res.json(started);
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
@@ -543,10 +239,17 @@ async function startServer() {
     try {
       getOrCreateBrowserSessionId(req, res);
       const body = (req.body ?? {}) as { clientIdOverride?: string | null };
-      const deviceSession = await chatgptAuth.startDeviceCodeAuth({
-        clientIdOverride: body.clientIdOverride ?? null,
-      });
-      res.json(deviceSession);
+      const endAuth = telemetry.beginSpan('router->chatgpt');
+      try {
+        const deviceSession = await chatgptAuth.startDeviceCodeAuth({
+          clientIdOverride: body.clientIdOverride ?? null,
+        });
+        endAuth('ok');
+        res.json(deviceSession);
+      } catch (err) {
+        endAuth('error');
+        throw err;
+      }
     } catch (err) {
       res.status(400).json({ error: (err as Error).message });
     }
@@ -564,6 +267,7 @@ async function startServer() {
   });
 
   const handleOAuthCallback: express.RequestHandler = async (req, res) => {
+    const endLoopback = telemetry.beginSpan('chatgpt->loopback');
     try {
       const profile = await chatgptAuth.completeAuthorizationCallback({
         code: typeof req.query.code === 'string' ? req.query.code : undefined,
@@ -575,8 +279,10 @@ async function startServer() {
             ? req.query.error_description
             : undefined,
       });
+      endLoopback('ok');
       res.status(200).type('html').send(buildPopupCompletionHtml(profile, '*'));
     } catch (err) {
+      endLoopback('error');
       res.status(400).type('html').send(buildPopupErrorHtml((err as Error).message));
     }
   };
@@ -587,6 +293,7 @@ async function startServer() {
   );
 
   app.post('/api/auth/openai/complete-redirect', async (req, res) => {
+    const endLoopback = telemetry.beginSpan('chatgpt->loopback');
     try {
       const body = (req.body ?? {}) as { redirectUrl?: string };
       const rawUrl = (body.redirectUrl ?? '').trim();
@@ -602,12 +309,14 @@ async function startServer() {
         error: parsed.searchParams.get('error') ?? undefined,
         errorDescription: parsed.searchParams.get('error_description') ?? undefined,
       });
+      endLoopback('ok');
       res.json({
         profile,
         profiles: chatgptAuth.listProfiles(),
         activeProfileId: profile.profileId,
       });
     } catch (err) {
+      endLoopback('error');
       res.status(400).json({ error: (err as Error).message });
     }
   });
@@ -637,15 +346,19 @@ async function startServer() {
   });
 
   app.get('/api/auth/openai/models', async (_req, res) => {
+    const endGpt = telemetry.beginSpan('router->chatgpt');
     try {
       const models = await chatgptAuth.listModels();
+      endGpt('ok');
       res.json({ models });
     } catch (err) {
+      endGpt('error');
       res.status(400).json({ error: (err as Error).message, models: [] });
     }
   });
 
   app.post('/api/auth/openai/verify', async (req, res) => {
+    const endGpt = telemetry.beginSpan('router->chatgpt');
     try {
       const body = (req.body ?? {}) as { model?: string };
       const result = await chatgptAuth.streamResponses({
@@ -654,186 +367,251 @@ async function startServer() {
         input: 'Reply with exactly: Token sharing works.',
         timeoutMs: 12_000,
       });
+      endGpt('ok');
       res.json({
         ok: true,
         model: result.model,
         text: result.text,
       });
     } catch (err) {
+      endGpt('error');
       res.status(400).json({ ok: false, error: (err as Error).message });
     }
   });
 
-  // --- Semantic Router API routes ---
+  // --- Semantic Router & Unified RAG API routes ---
 
   app.get('/api/health', (_req, res) => {
+    const data = service.getWorkspaceData();
     res.json({
       ok: true,
-      routeCount: state.routes.length,
+      routeCount: data.routes.length,
+      ragConnectorCount: data.ragConnectors.length,
+      ragChunksCount: data.ragChunksCount,
+      mcpEnabled: data.config.mcpEnabled,
       chatGptConnected: Boolean(chatgptAuth.getActiveProfile()?.connected),
     });
   });
 
   app.get('/api/routes', (_req, res) => {
-    res.json({
-      routes: state.routes,
-      evalCases: state.evalCases,
-      config: state.config,
-    });
+    res.json(service.getWorkspaceData());
   });
 
   app.post('/api/routes', (req, res) => {
-    const body = req.body as Partial<RouteDefinition>;
-    const name = (body.name ?? '').trim();
-    const utterances = Array.isArray(body.utterances)
-      ? body.utterances.map((u) => String(u).trim()).filter(Boolean)
-      : [];
-
-    if (!name) {
-      res.status(400).json({ error: 'Route name is required.' });
-      return;
+    try {
+      const route = service.createRoute(req.body as Partial<RouteDefinition>);
+      res.status(201).json({ route });
+    } catch (err) {
+      const status = (err as Error & { status?: number }).status ?? 400;
+      res.status(status).json({ error: (err as Error).message });
     }
-    if (utterances.length === 0) {
-      res.status(400).json({ error: 'At least one example utterance is required.' });
-      return;
-    }
-    if (state.routes.some((r) => r.name.toLowerCase() === name.toLowerCase())) {
-      res.status(409).json({ error: `Route "${name}" already exists.` });
-      return;
-    }
-
-    const newRoute: RouteDefinition = {
-      id: `route-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      name,
-      description: (body.description ?? '').trim() || `Semantic route for ${name}`,
-      utterances,
-      scoreThreshold:
-        typeof body.scoreThreshold === 'number'
-          ? Math.max(0.05, Math.min(0.99, body.scoreThreshold))
-          : state.config.defaultThreshold,
-      routeType: body.routeType === 'dynamic' ? 'dynamic' : 'static',
-      targetModel: (body.targetModel ?? '').trim() || 'openai:chatgpt-flagship',
-      enabled: body.enabled !== false,
-      functionSchema:
-        body.routeType === 'dynamic' && body.functionSchema
-          ? body.functionSchema
-          : undefined,
-      createdAt: new Date().toISOString(),
-    };
-
-    state.routes = [newRoute, ...state.routes];
-    saveState(state);
-    res.status(201).json({ route: newRoute });
   });
 
   app.put('/api/routes/:id', (req, res) => {
-    const { id } = req.params;
-    const idx = state.routes.findIndex((r) => r.id === id);
-    if (idx === -1) {
-      res.status(404).json({ error: 'Route not found.' });
-      return;
+    try {
+      const route = service.updateRoute(req.params.id, req.body as Partial<RouteDefinition>);
+      res.json({ route });
+    } catch (err) {
+      const status = (err as Error & { status?: number }).status ?? 400;
+      res.status(status).json({ error: (err as Error).message });
     }
-
-    const body = req.body as Partial<RouteDefinition>;
-    const existing = state.routes[idx];
-
-    const updatedName = body.name !== undefined ? body.name.trim() : existing.name;
-    if (!updatedName) {
-      res.status(400).json({ error: 'Route name cannot be empty.' });
-      return;
-    }
-
-    const updatedUtterances =
-      body.utterances !== undefined
-        ? body.utterances.map((u) => String(u).trim()).filter(Boolean)
-        : existing.utterances;
-
-    if (updatedUtterances.length === 0) {
-      res.status(400).json({ error: 'At least one utterance is required.' });
-      return;
-    }
-
-    const updated: RouteDefinition = {
-      ...existing,
-      name: updatedName,
-      description:
-        body.description !== undefined ? body.description.trim() : existing.description,
-      utterances: updatedUtterances,
-      scoreThreshold:
-        typeof body.scoreThreshold === 'number'
-          ? Math.max(0.05, Math.min(0.99, body.scoreThreshold))
-          : existing.scoreThreshold,
-      routeType: body.routeType ?? existing.routeType,
-      targetModel:
-        body.targetModel !== undefined ? body.targetModel.trim() : existing.targetModel,
-      enabled: body.enabled !== undefined ? body.enabled : existing.enabled,
-      functionSchema:
-        (body.routeType ?? existing.routeType) === 'dynamic'
-          ? body.functionSchema ?? existing.functionSchema
-          : undefined,
-    };
-
-    state.routes[idx] = updated;
-    saveState(state);
-    res.json({ route: updated });
   });
 
   app.delete('/api/routes/:id', (req, res) => {
-    const { id } = req.params;
-    const beforeLen = state.routes.length;
-    state.routes = state.routes.filter((r) => r.id !== id);
-    if (state.routes.length === beforeLen) {
+    const deleted = service.deleteRoute(req.params.id);
+    if (!deleted) {
       res.status(404).json({ error: 'Route not found.' });
       return;
     }
-    saveState(state);
-    res.json({ deletedId: id });
+    res.json({ deletedId: req.params.id });
   });
 
   app.put('/api/config', (req, res) => {
     const body = req.body as Partial<RouterConfig> & { calibrateThresholds?: boolean };
-    const prevEncoder = state.config.encoderModel;
-    const nextEncoder = migrateLegacyEncoder(body.encoderModel ?? state.config.encoderModel);
-    const providerMeta = ENCODER_PROVIDERS.find((p) => p.id === nextEncoder);
-
-    state.config = {
-      mode: body.mode ?? state.config.mode,
-      alpha:
-        typeof body.alpha === 'number'
-          ? Math.max(0, Math.min(1, body.alpha))
-          : state.config.alpha,
-      aggregation: body.aggregation ?? state.config.aggregation,
-      defaultThreshold:
-        typeof body.defaultThreshold === 'number'
-          ? Math.max(0.05, Math.min(0.99, body.defaultThreshold))
-          : body.calibrateThresholds && providerMeta
-            ? providerMeta.recommendedThreshold
-            : state.config.defaultThreshold,
-      encoderModel: nextEncoder,
-    };
-
-    if (body.calibrateThresholds && prevEncoder !== nextEncoder && providerMeta) {
-      state.routes = state.routes.map((r) => ({
-        ...r,
-        scoreThreshold: providerMeta.recommendedThreshold,
-      }));
-    }
-
-    saveState(state);
-    res.json({ config: state.config, routes: state.routes });
+    res.json(service.updateConfig(body));
   });
 
-  app.get('/api/providers', (_req, res) => {
+  // --- Dual System Instructions API ---
+
+  app.get('/api/instructions', (_req, res) => {
+    res.json({ instructions: service.getInstructions() });
+  });
+
+  app.put('/api/instructions', (req, res) => {
+    const body = req.body as Partial<SystemInstructionsConfig>;
+    const instructions = service.updateInstructions(body);
+    res.json({ instructions });
+  });
+
+  app.post('/api/instructions/reset', (_req, res) => {
+    const instructions = service.updateInstructions(structuredClone(DEFAULT_SYSTEM_INSTRUCTIONS));
+    res.json({ instructions });
+  });
+
+  app.post('/api/embeddings/rewarm', async (_req, res) => {
+    await service.warmUpEmbeddings();
+    res.json({ ok: true, ...service.getProvidersMetadata() });
+  });
+
+  // --- Architecture Library Knowledge API ---
+
+  app.get('/api/knowledge', (_req, res) => {
+    res.json({ knowledge: service.getLibraryKnowledge() });
+  });
+
+  app.put('/api/knowledge', (req, res) => {
+    const body = (req.body ?? {}) as Partial<LibraryKnowledgeState>;
+    const knowledge = service.updateLibraryKnowledge(body);
+    res.json({ knowledge });
+  });
+
+  app.post('/api/knowledge/reset', (_req, res) => {
+    const knowledge = service.resetLibraryKnowledge();
+    res.json({ knowledge });
+  });
+
+  // --- Unified RAG Server & External Webhook/URL Connectors ---
+
+  app.get('/api/rag/demo-webhook', (_req, res) => {
     res.json({
-      activeEncoder: state.config.encoderModel,
-      e5Status,
-      e5CachedCount: e5EmbeddingCache.size,
-      encoders: ENCODER_PROVIDERS,
-      routeFunctions: ROUTE_PROVIDER_FUNCTIONS,
+      source: 'Semantic Router Studio Built-in Knowledge Webhook',
+      updatedAt: new Date().toISOString(),
+      documents: [
+        {
+          title: 'Aurelio Semantic Router Hybrid Scoring',
+          content:
+            'Semantic Router Studio blends dense bi-encoder cosine similarity (intfloat/e5-small-v2 384-dim) with sparse BM25/IDF token similarity using configurable alpha weighting and max/mean/top_k_mean aggregation.',
+        },
+        {
+          title: 'SQL Analytics Optimization Best Practices',
+          content:
+            'For PostgreSQL analytical workloads, composite B-Tree indexes should order high-selectivity equality predicates first, followed by range/window partition columns. Window functions like ROW_NUMBER() and SUM() OVER (PARTITION BY ...) avoid self-joins.',
+        },
+        {
+          title: 'MCP Stdio & Unified RAG Transport',
+          content:
+            'The unified Semantic Router & RAG Server exposes identical route_prompt, rag_retrieve, and sync_rag_connector capabilities over both HTTP (/api/*) and Model Context Protocol (stdin/stdout JSON-RPC 2.0).',
+        },
+        {
+          title: 'Billing Refund Policy & Order Validation',
+          content:
+            'Duplicate credit card charges referencing order identifiers (ORD-XXXX or INV-XXX) qualify for automated review tickets via process_billing_refund when a valid reason is provided.',
+        },
+      ],
     });
   });
 
-  // --- Live Telemetry & Monitoring API + SSE Stream ---
+  app.get('/api/rag/connectors', (_req, res) => {
+    res.json({
+      connectors: service.getRagConnectors(),
+      chunks: service.getRagChunks(),
+    });
+  });
+
+  app.post('/api/rag/connectors', (req, res) => {
+    try {
+      const connector = service.createRagConnector(req.body as Partial<RagConnector>);
+      res.status(201).json({ connector });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.put('/api/rag/connectors/:id', (req, res) => {
+    try {
+      const connector = service.updateRagConnector(
+        req.params.id,
+        req.body as Partial<RagConnector>
+      );
+      res.json({ connector });
+    } catch (err) {
+      const status = (err as Error & { status?: number }).status ?? 400;
+      res.status(status).json({ error: (err as Error).message });
+    }
+  });
+
+  app.delete('/api/rag/connectors/:id', (req, res) => {
+    const deleted = service.deleteRagConnector(req.params.id);
+    if (!deleted) {
+      res.status(404).json({ error: 'RAG connector not found.' });
+      return;
+    }
+    res.json({ deletedId: req.params.id });
+  });
+
+  app.post('/api/rag/connectors/:id/sync', async (req, res) => {
+    try {
+      const result = await service.syncRagConnector(req.params.id);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/rag/chunks', (req, res) => {
+    const connectorId =
+      typeof req.query.connectorId === 'string' ? req.query.connectorId : undefined;
+    res.json({ chunks: service.getRagChunks(connectorId) });
+  });
+
+  app.post('/api/rag/query', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        query?: string;
+        connectorIds?: string[];
+        routeId?: string | null;
+        topK?: number;
+      };
+      const result = await service.queryRag({
+        query: body.query ?? '',
+        connectorIds: body.connectorIds,
+        routeId: body.routeId,
+        topK: body.topK,
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Optional MCP Server (stdin/stdout) Live Bridge ---
+
+  app.get('/api/mcp/logs', (_req, res) => {
+    res.json({
+      mcpEnabled: service.getConfig().mcpEnabled,
+      logs: service.getMcpLogs(),
+    });
+  });
+
+  app.post('/api/mcp/stdio', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        raw?: string;
+        jsonrpc?: Record<string, unknown>;
+      };
+      const payload = body.raw?.trim() ? body.raw : body.jsonrpc;
+      if (!payload) {
+        res.status(400).json({ error: 'Provide raw JSON-RPC string or jsonrpc object.' });
+        return;
+      }
+      const result = await invokeSingleMcpJsonRpc(service, telemetry, payload);
+      res.json({
+        ...result,
+        logs: service.getMcpLogs(),
+      });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  // --- Providers & Telemetry ---
+
+  app.get('/api/providers', (_req, res) => {
+    res.json({
+      ...service.getProvidersMetadata(),
+      routeFunctions: ROUTE_PROVIDER_FUNCTIONS,
+    });
+  });
 
   app.get('/api/telemetry', (_req, res) => {
     res.json(telemetry.getSnapshot());
@@ -863,12 +641,8 @@ async function startServer() {
   });
 
   app.post('/api/telemetry/probe', async (_req, res) => {
-    const embedStart = process.hrtime.bigint();
     try {
-      const probeText = 'health probe embedding check';
-      await buildVectorLookup([probeText], [], state.config.encoderModel);
-      lastEmbedLatencyMs =
-        Math.round((Number(process.hrtime.bigint() - embedStart) / 1_000_000) * 100) / 100;
+      await service.embedTest('health probe embedding check');
     } catch (err) {
       console.warn('Probe embedding warning:', (err as Error).message);
     }
@@ -878,21 +652,8 @@ async function startServer() {
 
   app.post('/api/providers/embed-test', async (req, res) => {
     const body = req.body as { text?: string; encoderModel?: EncoderModelId };
-    const text = (body.text ?? '').trim() || 'What time is it in Tokyo right now?';
-    const encoderModel = migrateLegacyEncoder(body.encoderModel ?? state.config.encoderModel);
-    const startNs = process.hrtime.bigint();
-    const { lookup, encoderUsed } = await buildVectorLookup([text], [], encoderModel);
-    const vec = lookup.getQueryVector ? lookup.getQueryVector(text) : lookup.getVector(text);
-    const elapsedMs = Number(process.hrtime.bigint() - startNs) / 1_000_000;
-    lastEmbedLatencyMs = Math.round(elapsedMs * 100) / 100;
-    res.json({
-      text,
-      encoderModel,
-      encoderUsed,
-      dimensions: vec.length,
-      preview: vec.slice(0, 8).map((v) => Math.round(v * 10000) / 10000),
-      latencyMs: lastEmbedLatencyMs,
-    });
+    const result = await service.embedTest(body.text ?? '', body.encoderModel);
+    res.json(result);
   });
 
   app.post('/api/providers/execute', async (req, res) => {
@@ -902,7 +663,7 @@ async function startServer() {
       query?: string;
     };
     const providerId = (body.providerId ?? '').trim() || 'fallback-none';
-    const result = await executeProviderFunction(
+    const { result } = await service.executeProviderFunction(
       providerId,
       body.arguments ?? {},
       (body.query ?? '').trim() || 'Sample test invocation'
@@ -911,174 +672,63 @@ async function startServer() {
   });
 
   app.post('/api/route', async (req, res) => {
-    const body = req.body as {
-      query?: string;
-      mode?: RouterConfig['mode'];
-      alpha?: number;
-      aggregation?: RouterConfig['aggregation'];
-      encoderModel?: EncoderModelId;
-      executeProvider?: boolean;
-    };
-
-    const query = (body.query ?? '').trim();
-    if (!query) {
-      res.status(400).json({ error: 'Prompt query is required.' });
-      return;
+    try {
+      const body = req.body as {
+        query?: string;
+        mode?: RouterConfig['mode'];
+        alpha?: number;
+        aggregation?: RouterConfig['aggregation'];
+        encoderModel?: EncoderModelId;
+        executeProvider?: boolean;
+        useRag?: boolean;
+      };
+      const decision = await service.routePrompt({
+        query: body.query ?? '',
+        mode: body.mode,
+        alpha: body.alpha,
+        aggregation: body.aggregation,
+        encoderModel: body.encoderModel,
+        executeProvider: body.executeProvider,
+        useRag: body.useRag,
+        transport: 'http',
+      });
+      res.json(decision);
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
     }
-
-    const activeConfig: RouterConfig = {
-      ...state.config,
-      ...(body.mode ? { mode: body.mode } : {}),
-      ...(typeof body.alpha === 'number' ? { alpha: body.alpha } : {}),
-      ...(body.aggregation ? { aggregation: body.aggregation } : {}),
-      ...(body.encoderModel ? { encoderModel: migrateLegacyEncoder(body.encoderModel) } : {}),
-    };
-
-    const startNs = process.hrtime.bigint();
-    const passages = collectRouteUtterances(state.routes);
-    const embedStartNs = process.hrtime.bigint();
-    const { lookup, encoderUsed } =
-      activeConfig.mode === 'sparse'
-        ? { lookup: createLocalVectorLookup(), encoderUsed: 'Sparse BM25 / Lexical' }
-        : await buildVectorLookup([query], passages, activeConfig.encoderModel);
-    lastEmbedLatencyMs =
-      Math.round((Number(process.hrtime.bigint() - embedStartNs) / 1_000_000) * 100) / 100;
-
-    const scored = scoreRoutes(query, state.routes, activeConfig, lookup);
-    let functionCall: ExtractedFunctionCall | null = null;
-    if (
-      scored.matchedRoute &&
-      scored.matchedRoute.routeType === 'dynamic' &&
-      scored.matchedRoute.functionSchema
-    ) {
-      functionCall = await extractDynamicParameters(
-        query,
-        scored.matchedRoute.functionSchema
-      );
-    }
-
-    let providerExecution: ProviderExecutionResult | null = null;
-    if (body.executeProvider !== false) {
-      const targetProvider = scored.matchedRoute?.targetModel ?? 'fallback-none';
-      const args = functionCall?.arguments ?? {};
-      providerExecution = await executeProviderFunction(targetProvider, args, query);
-    }
-
-    const elapsedMs = Number(process.hrtime.bigint() - startNs) / 1_000_000;
-    lastRouteLatencyMs = Math.round(elapsedMs * 100) / 100;
-    lastRouterError = null;
-
-    const decision: RouteDecisionResult = {
-      query,
-      matchedRoute: scored.matchedRoute ? scored.matchedRoute.name : null,
-      matchedRouteId: scored.matchedRoute ? scored.matchedRoute.id : null,
-      matchedRouteType: scored.matchedRoute ? scored.matchedRoute.routeType : null,
-      targetModel: scored.matchedRoute ? scored.matchedRoute.targetModel : null,
-      topScore: scored.topScore,
-      thresholdUsed: scored.matchedRoute
-        ? scored.matchedRoute.scoreThreshold
-        : scored.allScores[0]?.threshold ?? null,
-      latencyMs: lastRouteLatencyMs,
-      encoderUsed,
-      mode: activeConfig.mode,
-      alpha: activeConfig.alpha,
-      aggregation: activeConfig.aggregation,
-      functionCall,
-      providerExecution,
-      allScores: scored.allScores,
-    };
-
-    res.json(decision);
   });
 
   app.post('/api/evaluate', async (_req, res) => {
-    isEvaluatingOrFitting = true;
-    telemetry.notify();
-    try {
-      const queryTexts = state.evalCases.map((c) => c.query);
-      const passageTexts = collectRouteUtterances(state.routes);
-      const { lookup, encoderUsed } =
-        state.config.mode === 'sparse'
-          ? { lookup: createLocalVectorLookup(), encoderUsed: 'Sparse BM25 / Lexical' }
-          : await buildVectorLookup(queryTexts, passageTexts, state.config.encoderModel);
-
-      const report = evaluateDataset(
-        state.evalCases,
-        state.routes,
-        state.config,
-        lookup,
-        encoderUsed
-      );
-      res.json(report);
-    } finally {
-      isEvaluatingOrFitting = false;
-      telemetry.notify();
-    }
+    const report = await service.evaluate();
+    res.json(report);
   });
 
   app.post('/api/fit', async (_req, res) => {
-    isEvaluatingOrFitting = true;
-    telemetry.notify();
-    try {
-      const queryTexts = state.evalCases.map((c) => c.query);
-      const passageTexts = collectRouteUtterances(state.routes);
-      const { lookup } =
-        state.config.mode === 'sparse'
-          ? { lookup: createLocalVectorLookup() }
-          : await buildVectorLookup(queryTexts, passageTexts, state.config.encoderModel);
-
-      const fitReport = optimizeRouteThresholds(
-        state.evalCases,
-        state.routes,
-        state.config,
-        lookup
-      );
-      state.routes = fitReport.updatedRoutes;
-      saveState(state);
-      res.json(fitReport);
-    } finally {
-      isEvaluatingOrFitting = false;
-      telemetry.notify();
-    }
+    const fitReport = await service.fit();
+    res.json(fitReport);
   });
 
   app.post('/api/eval-cases', (req, res) => {
-    const body = req.body as { query?: string; expectedRoute?: string | null };
-    const query = (body.query ?? '').trim();
-    if (!query) {
-      res.status(400).json({ error: 'Evaluation query is required.' });
-      return;
+    try {
+      const body = req.body as { query?: string; expectedRoute?: string | null };
+      const evalCase = service.addEvalCase(body.query ?? '', body.expectedRoute ?? null);
+      res.status(201).json({ evalCase });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
     }
-    const newCase: EvalCase = {
-      id: `eval-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      query,
-      expectedRoute: body.expectedRoute ? body.expectedRoute.trim() : null,
-    };
-    state.evalCases = [newCase, ...state.evalCases];
-    saveState(state);
-    res.status(201).json({ evalCase: newCase });
   });
 
   app.delete('/api/eval-cases/:id', (req, res) => {
-    const { id } = req.params;
-    const before = state.evalCases.length;
-    state.evalCases = state.evalCases.filter((c) => c.id !== id);
-    if (state.evalCases.length === before) {
+    const deleted = service.deleteEvalCase(req.params.id);
+    if (!deleted) {
       res.status(404).json({ error: 'Evaluation case not found.' });
       return;
     }
-    saveState(state);
-    res.json({ deletedId: id });
+    res.json({ deletedId: req.params.id });
   });
 
   app.post('/api/reset', (_req, res) => {
-    state = {
-      routes: structuredClone(SEED_ROUTES),
-      evalCases: structuredClone(SEED_EVAL_CASES),
-      config: { ...DEFAULT_ROUTER_CONFIG },
-    };
-    saveState(state);
-    res.json(state);
+    res.json(service.resetWorkspace());
   });
 
   // Vite dev middleware vs production static serving
@@ -1099,7 +749,19 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Semantic Router Studio listening on http://0.0.0.0:${PORT}`);
-    void warmUpE5(state.routes);
+    void (async () => {
+      // Auto-sync enabled RAG connectors that haven't been synced yet
+      for (const conn of service.getRagConnectors()) {
+        if (conn.enabled && conn.lastSyncedAt === null) {
+          try {
+            await service.syncRagConnector(conn.id);
+          } catch (err) {
+            console.warn(`Initial RAG connector sync (${conn.name}) skipped:`, (err as Error).message);
+          }
+        }
+      }
+      await service.warmUpEmbeddings();
+    })();
   });
 }
 

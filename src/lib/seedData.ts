@@ -1,4 +1,10 @@
-import type { EvalCase, RouteDefinition, RouterConfig } from './types.ts';
+import type {
+  EvalCase,
+  RagConnector,
+  RouteDefinition,
+  RouterConfig,
+  SystemInstructionsConfig,
+} from './types.ts';
 
 export const DEFAULT_ROUTER_CONFIG: RouterConfig = {
   mode: 'hybrid',
@@ -6,7 +12,51 @@ export const DEFAULT_ROUTER_CONFIG: RouterConfig = {
   aggregation: 'max',
   defaultThreshold: 0.62,
   encoderModel: 'e5-small-v2',
+  mcpEnabled: true,
+  ragEnabledByDefault: true,
 };
+
+export const DEFAULT_SYSTEM_INSTRUCTIONS: SystemInstructionsConfig = {
+  embedding: {
+    queryTemplate: 'query: {instruction}{context}{text}',
+    passageTemplate: 'passage: {context}{text}',
+    taskInstruction: '',
+    lowercaseInput: false,
+    stripExtraWhitespace: true,
+    maxChars: 512,
+  },
+  chatgpt: {
+    responseSystemPrompt:
+      'You are a concise backend execution target dispatched by Semantic Router. Reply directly and accurately.',
+    extractionSystemPrompt:
+      'Extract JSON function arguments strictly matching the schema. Return ONLY raw valid JSON object with keys matching parameter names.',
+    ragContextTemplate:
+      'Grounding context retrieved from external RAG connectors:\n{rag_context}',
+    enforceCitations: true,
+    conciseMode: true,
+  },
+};
+
+export const SEED_RAG_CONNECTORS: RagConnector[] = [
+  {
+    id: 'rag-conn-router-docs',
+    name: 'Semantic Router Architecture Feed',
+    url: 'http://127.0.0.1:3000/api/rag/demo-webhook',
+    method: 'GET',
+    headers: {},
+    parserMode: 'json',
+    jsonPath: 'documents',
+    boundRouteIds: [],
+    chunkSize: 380,
+    chunkOverlap: 40,
+    enabled: true,
+    lastSyncedAt: null,
+    lastStatus: 'idle',
+    lastLatencyMs: null,
+    lastError: null,
+    chunkCount: 0,
+  },
+];
 
 export const SEED_ROUTES: RouteDefinition[] = [
   {
@@ -41,6 +91,10 @@ export const SEED_ROUTES: RouteDefinition[] = [
     routeType: 'static',
     targetModel: 'openai:chatgpt-fast',
     enabled: true,
+    instructionOverrides: {
+      chatgptSystemInstruction:
+        'You are a warm, brief conversational assistant routed for chitchat. Keep replies under 3 sentences.',
+    },
     createdAt: '2026-11-01T09:05:00.000Z',
   },
   {
@@ -93,6 +147,11 @@ export const SEED_ROUTES: RouteDefinition[] = [
     routeType: 'static',
     targetModel: 'openai:chatgpt-flagship',
     enabled: true,
+    instructionOverrides: {
+      embeddingContextPrefix: '[SQL & Database Engineering] ',
+      chatgptSystemInstruction:
+        'You are a senior PostgreSQL and analytics SQL engineer. Provide clean, indexed, production-ready SQL with brief performance notes.',
+    },
     createdAt: '2026-11-01T09:15:00.000Z',
   },
   {

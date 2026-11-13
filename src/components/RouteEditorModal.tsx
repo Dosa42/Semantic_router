@@ -1,6 +1,11 @@
 import React, { useEffect, useState } from 'react';
-import { Plus, Trash2, X } from 'lucide-react';
-import type { FunctionParameter, RouteDefinition, RouteType } from '../lib/types';
+import { ChevronDown, ChevronUp, Plus, Trash2, X } from 'lucide-react';
+import type {
+  FunctionParameter,
+  RouteDefinition,
+  RouteInstructionOverride,
+  RouteType,
+} from '../lib/types';
 
 interface RouteEditorModalProps {
   isOpen: boolean;
@@ -21,6 +26,7 @@ interface RouteEditorModalProps {
       description: string;
       parameters: FunctionParameter[];
     };
+    instructionOverrides?: RouteInstructionOverride;
   }) => Promise<void>;
 }
 
@@ -41,6 +47,9 @@ export function RouteEditorModal({
   const [fnName, setFnName] = useState('');
   const [fnDescription, setFnDescription] = useState('');
   const [fnParams, setFnParams] = useState<FunctionParameter[]>([]);
+  const [overridesOpen, setOverridesOpen] = useState(false);
+  const [embPrefixOverride, setEmbPrefixOverride] = useState('');
+  const [gptPromptOverride, setGptPromptOverride] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
@@ -58,6 +67,11 @@ export function RouteEditorModal({
       setFnName(initialRoute.functionSchema?.name ?? `${initialRoute.name}_handler`);
       setFnDescription(initialRoute.functionSchema?.description ?? '');
       setFnParams(initialRoute.functionSchema?.parameters ?? []);
+      const embOvr = initialRoute.instructionOverrides?.embeddingContextPrefix ?? '';
+      const gptOvr = initialRoute.instructionOverrides?.chatgptSystemInstruction ?? '';
+      setEmbPrefixOverride(embOvr);
+      setGptPromptOverride(gptOvr);
+      setOverridesOpen(Boolean(embOvr || gptOvr));
     } else {
       setName('');
       setDescription('');
@@ -69,8 +83,16 @@ export function RouteEditorModal({
       setFnName('');
       setFnDescription('');
       setFnParams([
-        { name: 'query_param', type: 'string', description: 'Extracted parameter value', required: true },
+        {
+          name: 'query_param',
+          type: 'string',
+          description: 'Extracted parameter value',
+          required: true,
+        },
       ]);
+      setEmbPrefixOverride('');
+      setGptPromptOverride('');
+      setOverridesOpen(false);
     }
   }, [isOpen, initialRoute, defaultThreshold]);
 
@@ -96,10 +118,7 @@ export function RouteEditorModal({
     setFnParams((prev) => prev.filter((_, idx) => idx !== index));
   };
 
-  const handleParamChange = (
-    index: number,
-    patch: Partial<FunctionParameter>
-  ) => {
+  const handleParamChange = (index: number, patch: Partial<FunctionParameter>) => {
     setFnParams((prev) =>
       prev.map((item, idx) => (idx === index ? { ...item, ...patch } : item))
     );
@@ -121,6 +140,11 @@ export function RouteEditorModal({
       setError('Enter at least one example utterance (one per line).');
       return;
     }
+
+    const instructionOverrides: RouteInstructionOverride = {
+      embeddingContextPrefix: embPrefixOverride.trim() || undefined,
+      chatgptSystemInstruction: gptPromptOverride.trim() || undefined,
+    };
 
     if (routeType === 'dynamic') {
       const cleanFn = fnName.trim() || `${cleanName}_tool`;
@@ -145,6 +169,7 @@ export function RouteEditorModal({
             description: fnDescription.trim() || `Execute ${cleanFn}`,
             parameters: validParams.map((p) => ({ ...p, name: p.name.trim() })),
           },
+          instructionOverrides,
         });
         onClose();
       } catch (err) {
@@ -166,6 +191,7 @@ export function RouteEditorModal({
         routeType: 'static',
         targetModel: targetModel.trim() || 'openai:chatgpt-flagship',
         enabled,
+        instructionOverrides,
       });
       onClose();
     } catch (err) {
@@ -209,7 +235,10 @@ export function RouteEditorModal({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
-              <label htmlFor="route-name-input" className="block text-sm font-medium text-slate-700 mb-1.5">
+              <label
+                htmlFor="route-name-input"
+                className="block text-sm font-medium text-slate-700 mb-1.5"
+              >
                 Route Name
               </label>
               <input
@@ -223,7 +252,10 @@ export function RouteEditorModal({
             </div>
 
             <div>
-              <label htmlFor="route-target-input" className="block text-sm font-medium text-slate-700 mb-1.5">
+              <label
+                htmlFor="route-target-input"
+                className="block text-sm font-medium text-slate-700 mb-1.5"
+              >
                 Target Handler / Model
               </label>
               <input
@@ -238,7 +270,10 @@ export function RouteEditorModal({
           </div>
 
           <div>
-            <label htmlFor="route-desc-input" className="block text-sm font-medium text-slate-700 mb-1.5">
+            <label
+              htmlFor="route-desc-input"
+              className="block text-sm font-medium text-slate-700 mb-1.5"
+            >
               Description
             </label>
             <input
@@ -282,7 +317,10 @@ export function RouteEditorModal({
 
             <div>
               <div className="flex items-center justify-between mb-1.5">
-                <label htmlFor="route-threshold-slider" className="text-sm font-medium text-slate-700">
+                <label
+                  htmlFor="route-threshold-slider"
+                  className="text-sm font-medium text-slate-700"
+                >
                   Score Threshold
                 </label>
                 <span className="text-sm font-mono tabular-nums font-semibold text-slate-900">
@@ -304,7 +342,10 @@ export function RouteEditorModal({
 
           <div>
             <div className="flex items-center justify-between mb-1.5">
-              <label htmlFor="route-utterances-input" className="text-sm font-medium text-slate-700">
+              <label
+                htmlFor="route-utterances-input"
+                className="text-sm font-medium text-slate-700"
+              >
                 Training Utterances (one phrase per line)
               </label>
               <span className="text-xs font-mono tabular-nums text-slate-500">
@@ -316,15 +357,73 @@ export function RouteEditorModal({
               rows={5}
               value={utterancesText}
               onChange={(e) => setUtterancesText(e.target.value)}
-              placeholder={"how do I reset my password?\nI can't sign into my account\nunlock my user profile"}
+              placeholder={
+                "how do I reset my password?\nI can't sign into my account\nunlock my user profile"
+              }
               className="w-full px-3 py-2 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600 focus:border-blue-600"
             />
+          </div>
+
+          {/* Per-Route System Instruction Overrides */}
+          <div className="pt-3 border-t border-slate-200">
+            <button
+              type="button"
+              onClick={() => setOverridesOpen((prev) => !prev)}
+              aria-expanded={overridesOpen}
+              className="w-full flex items-center justify-between text-left text-sm font-semibold text-slate-900 hover:text-blue-600 transition-colors"
+            >
+              <span>System Instruction Overrides (Embedding LM &amp; ChatGPT)</span>
+              {overridesOpen ? (
+                <ChevronUp className="w-4 h-4 text-slate-500" />
+              ) : (
+                <ChevronDown className="w-4 h-4 text-slate-500" />
+              )}
+            </button>
+
+            {overridesOpen && (
+              <div className="mt-3 space-y-3 p-3.5 bg-slate-50 border border-slate-200 rounded-md">
+                <div>
+                  <label
+                    htmlFor="route-emb-override"
+                    className="block text-xs font-medium text-slate-700 mb-1"
+                  >
+                    Embedding LM Context Prefix Override (optional)
+                  </label>
+                  <input
+                    id="route-emb-override"
+                    type="text"
+                    value={embPrefixOverride}
+                    onChange={(e) => setEmbPrefixOverride(e.target.value)}
+                    placeholder="e.g., [SQL & Database Engineering]"
+                    className="w-full px-3 py-1.5 text-xs font-mono bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+                <div>
+                  <label
+                    htmlFor="route-gpt-override"
+                    className="block text-xs font-medium text-slate-700 mb-1"
+                  >
+                    ChatGPT AI System Instruction Override (optional)
+                  </label>
+                  <textarea
+                    id="route-gpt-override"
+                    rows={3}
+                    value={gptPromptOverride}
+                    onChange={(e) => setGptPromptOverride(e.target.value)}
+                    placeholder="Leave blank to inherit global ChatGPT system instructions."
+                    className="w-full px-3 py-1.5 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
+              </div>
+            )}
           </div>
 
           {routeType === 'dynamic' && (
             <div className="pt-4 border-t border-slate-200 space-y-4">
               <div className="flex items-center justify-between">
-                <h3 className="text-sm font-semibold text-slate-900">Function Schema Definition</h3>
+                <h3 className="text-sm font-semibold text-slate-900">
+                  Function Schema Definition
+                </h3>
                 <button
                   type="button"
                   onClick={handleAddParam}
@@ -337,7 +436,10 @@ export function RouteEditorModal({
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
-                  <label htmlFor="fn-name-input" className="block text-xs font-medium text-slate-600 mb-1">
+                  <label
+                    htmlFor="fn-name-input"
+                    className="block text-xs font-medium text-slate-600 mb-1"
+                  >
                     Function Name
                   </label>
                   <input
@@ -350,7 +452,10 @@ export function RouteEditorModal({
                   />
                 </div>
                 <div>
-                  <label htmlFor="fn-desc-input" className="block text-xs font-medium text-slate-600 mb-1">
+                  <label
+                    htmlFor="fn-desc-input"
+                    className="block text-xs font-medium text-slate-600 mb-1"
+                  >
                     Function Description
                   </label>
                   <input

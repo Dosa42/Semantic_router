@@ -1,5 +1,7 @@
 import type {
   EncoderModelId,
+  TelemetryEdgeId,
+  TelemetryEdgeState,
   TelemetryEndpointMetric,
   TelemetryPortBinding,
   TelemetrySnapshot,
@@ -75,7 +77,11 @@ export function classifyEndpointTelemetry(
   const cleanMethod = method.toUpperCase();
   const pathOnly = reqPath.split('?')[0] || '/';
 
-  if (pathOnly.startsWith('/api/auth/openai') || pathOnly.startsWith('/auth/openai') || pathOnly.startsWith('/auth/callback')) {
+  if (
+    pathOnly.startsWith('/api/auth/openai') ||
+    pathOnly.startsWith('/auth/openai') ||
+    pathOnly.startsWith('/auth/callback')
+  ) {
     return {
       routePattern: `${cleanMethod} ${pathOnly}`,
       subsystem: 'ai_model',
@@ -111,6 +117,27 @@ export function classifyEndpointTelemetry(
       targetNode: 'semantic-router-rag',
     };
   }
+  if (pathOnly.startsWith('/api/rag/connectors/') && pathOnly.endsWith('/sync')) {
+    return {
+      routePattern: `${cleanMethod} /api/rag/connectors/:id/sync`,
+      subsystem: 'semantic_router',
+      targetNode: 'rag-connector',
+    };
+  }
+  if (pathOnly.startsWith('/api/rag/connectors/') && pathOnly.split('/').length === 5) {
+    return {
+      routePattern: `${cleanMethod} /api/rag/connectors/:id`,
+      subsystem: 'semantic_router',
+      targetNode: 'rag-connector',
+    };
+  }
+  if (pathOnly.startsWith('/api/mcp')) {
+    return {
+      routePattern: `${cleanMethod} ${pathOnly}`,
+      subsystem: 'semantic_router',
+      targetNode: 'mcp-stdio-bridge',
+    };
+  }
   return {
     routePattern: `${cleanMethod} ${pathOnly}`,
     subsystem: 'semantic_router',
@@ -137,6 +164,12 @@ export interface SubsystemStateInput {
   lastEmbedLatencyMs: number | null;
   loopbackListening: boolean;
   loopbackPort: number | null;
+  mcpEnabled?: boolean;
+  mcpCallCount?: number;
+  ragConnectorCount?: number;
+  ragChunkCount?: number;
+  lastRagLatencyMs?: number | null;
+  lastRagError?: string | null;
 }
 
 export function computeSubsystemSignals(input: SubsystemStateInput): {
@@ -166,10 +199,14 @@ export function computeSubsystemSignals(input: SubsystemStateInput): {
         : 'Signed in without chatgpt.tokens.use.direct scope';
   }
 
-  // 2. Middle: Semantic Router RAG (Hybrid / Dense / Sparse route index)
+  // 2. Middle: Semantic Router RAG (Hybrid / Dense / Sparse route index + MCP + Connectors)
   let routerLamp: TelemetrySubsystemStatus['lamp'] = 'green';
   let routerStatusText = 'ONLINE';
-  let routerDetail = `${input.activeRouteCount}/${input.totalRouteCount} routes active`;
+  const ragSuffix =
+    typeof input.ragChunkCount === 'number'
+      ? ` · ${input.ragChunkCount} RAG chunks`
+      : '';
+  let routerDetail = `${input.activeRouteCount}/${input.totalRouteCount} routes${ragSuffix}`;
   if (input.lastRouterError || input.activeRouteCount === 0) {
     routerLamp = 'red';
     routerStatusText = input.activeRouteCount === 0 ? 'NO_ROUTES' : 'ERROR';
@@ -215,17 +252,17 @@ export function computeSubsystemSignals(input: SubsystemStateInput): {
     },
     {
       id: 'semantic_router',
-      label: 'Semantic Router',
-      target: 'RAG Index Engine',
+      label: 'Router & RAG',
+      target: 'HTTP + MCP Engine',
       lamp: routerLamp,
       statusText: routerStatusText,
       detail: routerDetail,
-      portOrRuntime: `:${input.expressPort} HTTP`,
+      portOrRuntime: input.mcpEnabled === false ? `:${input.expressPort} HTTP` : `:${input.expressPort} + stdio`,
       lastLatencyMs: input.lastRouteLatencyMs,
     },
     {
       id: 'embedding_model',
-      label: 'Embedding Model',
+      label: 'Embedding LM',
       target: input.encoderModel === 'e5-small-v2' ? 'e5-small-v2' : 'subword-bm25',
       lamp: embedLamp,
       statusText: embedStatusText,
@@ -239,9 +276,53 @@ export function computeSubsystemSignals(input: SubsystemStateInput): {
     {
       port: input.expressPort,
       protocol: 'HTTP',
-      service: 'Express API + Vite App Server',
+      service: 'Express API Gateway + Vite',
       state: 'listening',
-      detail: '0.0.0.0:3000 (/api/* & SPA)',
+      detail: `0.0.0.0:${input.expressPort} (/api/* & SSE)`,
+      subsystem: 'semantic_router',
+    },
+    {
+      port: 0,
+      protocol: 'STDIO',
+      service: 'MCP JSON-RPC 2.0 Server',
+      state: input.mcpEnabled === false ? 'standby' : 'listening',
+      detail:
+        input.mcpEnabled === false
+          ? 'Disabled in router settings'
+          : `stdin/stdout active · ${input.mcpCallCount ?? 0} calls`,
+      subsystem: 'semantic_router',
+    },
+    {
+      port: 0,
+      protocol: 'IPC',
+      service: 'EmbeddingsBridge Orchestrator',
+      state: 'ready',
+      detail: `${input.e5CachedCount} cached formatted vectors`,
+      subsystem: 'embedding_model',
+    },
+    {
+      port: 0,
+      protocol: 'ONNX',
+      service: 'Xenova/e5-small-v2 Feature Extractor',
+      state:
+        input.e5Status === 'error'
+          ? 'error'
+          : input.e5Status === 'ready'
+            ? 'ready'
+            : 'warming',
+      detail: `${input.encoderModel} inference worker`,
+      subsystem: 'embedding_model',
+    },
+    {
+      port: 443,
+      protocol: 'HTTPS',
+      service: 'RAG Webhook / URL Connectors',
+      state: input.lastRagError
+        ? 'error'
+        : (input.ragConnectorCount ?? 0) > 0
+          ? 'egress'
+          : 'standby',
+      detail: `${input.ragConnectorCount ?? 0} connectors · ${input.ragChunkCount ?? 0} chunks`,
       subsystem: 'semantic_router',
     },
     {
@@ -262,23 +343,84 @@ export function computeSubsystemSignals(input: SubsystemStateInput): {
       detail: 'OIDC PKCE + Device Auth + Responses SSE',
       subsystem: 'ai_model',
     },
-    {
-      port: 0,
-      protocol: 'ONNX',
-      service: 'Xenova/e5-small-v2 Feature Extractor',
-      state:
-        input.e5Status === 'error'
-          ? 'error'
-          : input.e5Status === 'ready'
-            ? 'ready'
-            : 'warming',
-      detail: `${input.e5CachedCount} normalized vectors in memory`,
-      subsystem: 'embedding_model',
-    },
   ];
 
   return { subsystems, ports };
 }
+
+const DEFAULT_EDGE_DEFS: Array<{
+  id: TelemetryEdgeId;
+  from: string;
+  to: string;
+  label: string;
+  portOrChannel: string;
+  protocol: string;
+}> = [
+  {
+    id: 'browser->express',
+    from: 'browser',
+    to: 'express',
+    label: 'HTTP/SSE',
+    portOrChannel: ':3000',
+    protocol: 'HTTP',
+  },
+  {
+    id: 'mcp->router',
+    from: 'mcp',
+    to: 'router',
+    label: 'stdin/stdout',
+    portOrChannel: 'stdio',
+    protocol: 'MCP',
+  },
+  {
+    id: 'express->router',
+    from: 'express',
+    to: 'router',
+    label: '/api/*',
+    portOrChannel: ':3000',
+    protocol: 'IPC',
+  },
+  {
+    id: 'router->bridge',
+    from: 'router',
+    to: 'bridge',
+    label: 'Embed IPC',
+    portOrChannel: 'IPC',
+    protocol: 'IPC',
+  },
+  {
+    id: 'bridge->embedding',
+    from: 'bridge',
+    to: 'embedding',
+    label: 'ONNX 384d',
+    portOrChannel: 'ONNX',
+    protocol: 'ONNX',
+  },
+  {
+    id: 'router->rag_connector',
+    from: 'router',
+    to: 'rag_connector',
+    label: 'Webhook',
+    portOrChannel: ':443',
+    protocol: 'HTTPS',
+  },
+  {
+    id: 'router->chatgpt',
+    from: 'router',
+    to: 'chatgpt',
+    label: 'Responses',
+    portOrChannel: ':443',
+    protocol: 'HTTPS',
+  },
+  {
+    id: 'chatgpt->loopback',
+    from: 'chatgpt',
+    to: 'loopback',
+    label: 'PKCE Auth',
+    portOrChannel: ':1455',
+    protocol: 'HTTP',
+  },
+];
 
 const DEFAULT_ENDPOINTS: Array<{
   method: TelemetryEndpointMetric['method'];
@@ -290,6 +432,11 @@ const DEFAULT_ENDPOINTS: Array<{
   { method: 'POST', path: '/api/evaluate', subsystem: 'semantic_router', targetNode: 'semantic-router-rag' },
   { method: 'POST', path: '/api/fit', subsystem: 'semantic_router', targetNode: 'semantic-router-rag' },
   { method: 'GET', path: '/api/routes', subsystem: 'semantic_router', targetNode: 'semantic-router-rag' },
+  { method: 'GET', path: '/api/instructions', subsystem: 'embedding_model', targetNode: 'e5-onnx-worker' },
+  { method: 'PUT', path: '/api/instructions', subsystem: 'embedding_model', targetNode: 'e5-onnx-worker' },
+  { method: 'GET', path: '/api/rag/connectors', subsystem: 'semantic_router', targetNode: 'rag-connector' },
+  { method: 'POST', path: '/api/rag/query', subsystem: 'semantic_router', targetNode: 'rag-connector' },
+  { method: 'POST', path: '/api/mcp/stdio', subsystem: 'semantic_router', targetNode: 'mcp-stdio-bridge' },
   { method: 'POST', path: '/api/providers/embed-test', subsystem: 'embedding_model', targetNode: 'e5-onnx-worker' },
   { method: 'GET', path: '/api/providers', subsystem: 'embedding_model', targetNode: 'e5-onnx-worker' },
   { method: 'POST', path: '/api/providers/execute', subsystem: 'ai_model', targetNode: 'openai-oauth-llm' },
@@ -305,6 +452,7 @@ export class TelemetryCollector {
   private readonly startedAt = Date.now();
   private readonly traces: TelemetryTraceEvent[] = [];
   private readonly endpointMap = new Map<string, TelemetryEndpointMetric>();
+  private readonly edgeMap = new Map<TelemetryEdgeId, TelemetryEdgeState>();
   private readonly listeners = new Set<(snapshot: TelemetrySnapshot) => void>();
   private activeFlowEdge: string | null = null;
   private stateProvider: (() => SubsystemStateInput) | null = null;
@@ -324,6 +472,18 @@ export class TelemetryCollector {
         avgLatencyMs: null,
         lastLatencyMs: null,
         lastCalledAt: null,
+      });
+    }
+
+    for (const edgeDef of DEFAULT_EDGE_DEFS) {
+      this.edgeMap.set(edgeDef.id, {
+        ...edgeDef,
+        activeCount: 0,
+        lastStartedAtMs: null,
+        lastCompletedAtMs: null,
+        lastDurationMs: null,
+        hitCount: 0,
+        lastStatus: 'idle',
       });
     }
   }
@@ -349,6 +509,47 @@ export class TelemetryCollector {
         // Ignore broken SSE stream
       }
     }
+  }
+
+  beginSpan(edgeId: TelemetryEdgeId): (status?: 'ok' | 'error') => number {
+    const startNs = process.hrtime.bigint();
+    const edge = this.edgeMap.get(edgeId);
+    if (edge) {
+      edge.activeCount += 1;
+      edge.lastStartedAtMs = Date.now();
+      edge.lastStatus = 'active';
+      this.activeFlowEdge = edge.to;
+      this.notify();
+    }
+
+    let ended = false;
+    return (status: 'ok' | 'error' = 'ok') => {
+      const durationMs = Math.round((Number(process.hrtime.bigint() - startNs) / 1_000_000) * 100) / 100;
+      if (ended) return durationMs;
+      ended = true;
+      if (edge) {
+        edge.activeCount = Math.max(0, edge.activeCount - 1);
+        edge.lastCompletedAtMs = Date.now();
+        edge.lastDurationMs = durationMs;
+        edge.hitCount += 1;
+        edge.lastStatus = edge.activeCount > 0 ? 'active' : status;
+        this.notify();
+      }
+      return durationMs;
+    };
+  }
+
+  recordPulse(edgeId: TelemetryEdgeId, durationMs: number, status: 'ok' | 'error' = 'ok'): void {
+    const edge = this.edgeMap.get(edgeId);
+    if (!edge) return;
+    const now = Date.now();
+    edge.lastStartedAtMs = now;
+    edge.lastCompletedAtMs = now;
+    edge.lastDurationMs = Math.round(durationMs * 100) / 100;
+    edge.hitCount += 1;
+    edge.lastStatus = status;
+    this.activeFlowEdge = edge.to;
+    this.notify();
   }
 
   recordHttpEvent(event: {
@@ -422,7 +623,7 @@ export class TelemetryCollector {
   }
 
   getSnapshot(): TelemetrySnapshot {
-    const state = this.stateProvider
+    const state: SubsystemStateInput = this.stateProvider
       ? this.stateProvider()
       : {
           expressPort: 3000,
@@ -443,6 +644,12 @@ export class TelemetryCollector {
           lastEmbedLatencyMs: null,
           loopbackListening: false,
           loopbackPort: null,
+          mcpEnabled: true,
+          mcpCallCount: 0,
+          ragConnectorCount: 0,
+          ragChunkCount: 0,
+          lastRagLatencyMs: null,
+          lastRagError: null,
         };
 
     const { subsystems, ports } = computeSubsystemSignals(state);
@@ -458,7 +665,12 @@ export class TelemetryCollector {
       expressPort: state.expressPort,
       loopbackListening: state.loopbackListening,
       loopbackPort: state.loopbackPort,
+      mcpEnabled: state.mcpEnabled !== false,
+      mcpCallCount: state.mcpCallCount ?? 0,
+      ragConnectorCount: state.ragConnectorCount ?? 0,
+      ragChunkCount: state.ragChunkCount ?? 0,
       activeFlowEdge: this.activeFlowEdge,
+      edges: Array.from(this.edgeMap.values()).map((e) => ({ ...e })),
       subsystems,
       ports,
       endpoints,

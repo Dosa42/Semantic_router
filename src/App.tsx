@@ -7,18 +7,26 @@ import {
   Menu,
   Plus,
   RotateCcw,
+  SlidersHorizontal,
   Terminal,
   UserCheck,
   X,
 } from 'lucide-react';
+import { ArchitectureBlueprintDrawer } from './components/ArchitectureBlueprintDrawer';
 import { ChatGptAuthModal } from './components/ChatGptAuthModal';
 import { EvaluationView } from './components/EvaluationView';
+import { InstructionsView } from './components/InstructionsView';
 import { PlaygroundView } from './components/PlaygroundView';
 import { ProvidersView } from './components/ProvidersView';
 import { RouteEditorModal } from './components/RouteEditorModal';
 import { RoutesView } from './components/RoutesView';
 import { SdkView } from './components/SdkView';
-import { DEFAULT_ROUTER_CONFIG, SAMPLE_PLAYGROUND_PROMPTS } from './lib/seedData';
+import { DEFAULT_LIBRARY_KNOWLEDGE } from './lib/architectureBlueprints';
+import {
+  DEFAULT_ROUTER_CONFIG,
+  DEFAULT_SYSTEM_INSTRUCTIONS,
+  SAMPLE_PLAYGROUND_PROMPTS,
+} from './lib/seedData';
 import type {
   AggregationStrategy,
   ChatGptSessionState,
@@ -27,20 +35,26 @@ import type {
   EvalReport,
   FitReport,
   FunctionParameter,
+  LibraryKnowledgeState,
+  RagConnector,
+  RagParserMode,
   RouteDecisionResult,
   RouteDefinition,
+  RouteInstructionOverride,
   RouterConfig,
   RouteType,
   RoutingMode,
   RoutingTraceEntry,
+  SystemInstructionsConfig,
   TelemetrySnapshot,
 } from './lib/types';
 
-type NavTab = 'playground' | 'routes' | 'evaluation' | 'providers' | 'sdk';
+type NavTab = 'playground' | 'routes' | 'instructions' | 'evaluation' | 'providers' | 'sdk';
 
 const TAB_LABELS: Record<NavTab, string> = {
   playground: 'Playground',
   routes: 'Routes',
+  instructions: 'System Instructions',
   evaluation: 'Evaluation & Fit',
   providers: 'Providers & E5',
   sdk: 'SDK & API',
@@ -53,6 +67,14 @@ export default function App() {
   const [routes, setRoutes] = useState<RouteDefinition[]>([]);
   const [evalCases, setEvalCases] = useState<EvalCase[]>([]);
   const [config, setConfig] = useState<RouterConfig>(DEFAULT_ROUTER_CONFIG);
+  const [instructions, setInstructions] = useState<SystemInstructionsConfig>(
+    DEFAULT_SYSTEM_INSTRUCTIONS
+  );
+  const [ragConnectors, setRagConnectors] = useState<RagConnector[]>([]);
+  const [ragChunksCount, setRagChunksCount] = useState<number>(0);
+  const [libraryKnowledge, setLibraryKnowledge] = useState<LibraryKnowledgeState>(
+    DEFAULT_LIBRARY_KNOWLEDGE
+  );
   const [loadingInitial, setLoadingInitial] = useState(true);
   const [globalError, setGlobalError] = useState<string | null>(null);
 
@@ -74,14 +96,14 @@ export default function App() {
   const [telemetryStreamConnected, setTelemetryStreamConnected] = useState(false);
   const [probingTelemetry, setProbingTelemetry] = useState(false);
 
-  const runRouteQuery = useCallback(async (query: string) => {
+  const runRouteQuery = useCallback(async (query: string, useRag?: boolean) => {
     setRoutingLoading(true);
     setRoutingError(null);
     try {
       const res = await fetch('/api/route', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query }),
+        body: JSON.stringify({ query, useRag }),
       });
       const data = (await res.json()) as RouteDecisionResult & { error?: string };
       if (!res.ok) {
@@ -103,6 +125,22 @@ export default function App() {
     }
   }, []);
 
+  const refreshRagState = useCallback(async () => {
+    try {
+      const res = await fetch('/api/rag/connectors');
+      if (res.ok) {
+        const data = (await res.json()) as {
+          connectors: RagConnector[];
+          chunks: unknown[];
+        };
+        setRagConnectors(data.connectors);
+        setRagChunksCount(data.chunks.length);
+      }
+    } catch {
+      // Non-blocking
+    }
+  }, []);
+
   const loadWorkspace = useCallback(async () => {
     setLoadingInitial(true);
     setGlobalError(null);
@@ -113,10 +151,16 @@ export default function App() {
         routes: RouteDefinition[];
         evalCases: EvalCase[];
         config: RouterConfig;
+        instructions?: SystemInstructionsConfig;
+        ragConnectors?: RagConnector[];
+        ragChunksCount?: number;
       };
       setRoutes(data.routes);
       setEvalCases(data.evalCases);
       setConfig(data.config);
+      if (data.instructions) setInstructions(data.instructions);
+      if (data.ragConnectors) setRagConnectors(data.ragConnectors);
+      if (typeof data.ragChunksCount === 'number') setRagChunksCount(data.ragChunksCount);
     } catch (err) {
       setGlobalError((err as Error).message || 'Unable to connect to router server');
     } finally {
@@ -135,12 +179,45 @@ export default function App() {
     }
   }, []);
 
+  const loadLibraryKnowledge = useCallback(async () => {
+    try {
+      const res = await fetch('/api/knowledge');
+      if (res.ok) {
+        const data = (await res.json()) as { knowledge: LibraryKnowledgeState };
+        setLibraryKnowledge(data.knowledge);
+      }
+    } catch {
+      // Non-blocking; seeded blueprint defaults remain available
+    }
+  }, []);
+
+  const handleSaveLibraryKnowledge = async (patch: Partial<LibraryKnowledgeState>) => {
+    const res = await fetch('/api/knowledge', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { knowledge: LibraryKnowledgeState };
+      setLibraryKnowledge(data.knowledge);
+    }
+  };
+
+  const handleResetLibraryKnowledge = async () => {
+    const res = await fetch('/api/knowledge/reset', { method: 'POST' });
+    if (res.ok) {
+      const data = (await res.json()) as { knowledge: LibraryKnowledgeState };
+      setLibraryKnowledge(data.knowledge);
+    }
+  };
+
   useEffect(() => {
     void loadChatGptSession();
+    void loadLibraryKnowledge();
     void loadWorkspace().then(() => {
       void runRouteQuery(SAMPLE_PLAYGROUND_PROMPTS[0].prompt);
     });
-  }, [loadChatGptSession, loadWorkspace, runRouteQuery]);
+  }, [loadChatGptSession, loadLibraryKnowledge, loadWorkspace, runRouteQuery]);
 
   useEffect(() => {
     const handleOAuthMessage = (event: MessageEvent) => {
@@ -235,6 +312,81 @@ export default function App() {
     }
   };
 
+  const handleSaveInstructions = async (next: SystemInstructionsConfig) => {
+    const res = await fetch('/api/instructions', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(next),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as { instructions: SystemInstructionsConfig };
+      setInstructions(data.instructions);
+    }
+  };
+
+  const handleResetInstructions = async () => {
+    const res = await fetch('/api/instructions/reset', { method: 'POST' });
+    if (res.ok) {
+      const data = (await res.json()) as { instructions: SystemInstructionsConfig };
+      setInstructions(data.instructions);
+    }
+  };
+
+  const handleRewarmEmbeddings = async () => {
+    await fetch('/api/embeddings/rewarm', { method: 'POST' });
+  };
+
+  const handleCreateRagConnector = async (payload: {
+    name: string;
+    url: string;
+    method: 'GET' | 'POST';
+    parserMode: RagParserMode;
+    jsonPath?: string;
+  }) => {
+    const res = await fetch('/api/rag/connectors', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = (await res.json()) as { connector?: RagConnector; error?: string };
+    if (!res.ok || !data.connector) {
+      throw new Error(data.error || 'Failed to add RAG connector');
+    }
+    setRagConnectors((prev) => [data.connector!, ...prev]);
+    // Immediately attempt initial sync
+    try {
+      await fetch(`/api/rag/connectors/${data.connector.id}/sync`, { method: 'POST' });
+    } finally {
+      await refreshRagState();
+    }
+  };
+
+  const handleSyncRagConnector = async (id: string) => {
+    try {
+      await fetch(`/api/rag/connectors/${id}/sync`, { method: 'POST' });
+    } finally {
+      await refreshRagState();
+    }
+  };
+
+  const handleToggleRagConnector = async (connector: RagConnector) => {
+    const res = await fetch(`/api/rag/connectors/${connector.id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: !connector.enabled }),
+    });
+    if (res.ok) {
+      await refreshRagState();
+    }
+  };
+
+  const handleDeleteRagConnector = async (id: string) => {
+    const res = await fetch(`/api/rag/connectors/${id}`, { method: 'DELETE' });
+    if (res.ok) {
+      await refreshRagState();
+    }
+  };
+
   const handleSaveRoute = async (payload: {
     id?: string;
     name: string;
@@ -249,6 +401,7 @@ export default function App() {
       description: string;
       parameters: FunctionParameter[];
     };
+    instructionOverrides?: RouteInstructionOverride;
   }) => {
     const isEdit = Boolean(payload.id);
     const url = isEdit ? `/api/routes/${payload.id}` : '/api/routes';
@@ -348,10 +501,16 @@ export default function App() {
         routes: RouteDefinition[];
         evalCases: EvalCase[];
         config: RouterConfig;
+        instructions?: SystemInstructionsConfig;
+        ragConnectors?: RagConnector[];
+        ragChunksCount?: number;
       };
       setRoutes(data.routes);
       setEvalCases(data.evalCases);
       setConfig(data.config);
+      if (data.instructions) setInstructions(data.instructions);
+      if (data.ragConnectors) setRagConnectors(data.ragConnectors);
+      if (typeof data.ragChunksCount === 'number') setRagChunksCount(data.ragChunksCount);
       setFitReport(null);
       setEvalReport(null);
       void runRouteQuery(SAMPLE_PLAYGROUND_PROMPTS[0].prompt);
@@ -361,6 +520,7 @@ export default function App() {
   const navItems: Array<{ id: NavTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
     { id: 'playground', label: 'Playground', icon: Terminal },
     { id: 'routes', label: 'Routes', icon: GitBranch },
+    { id: 'instructions', label: 'System Instructions', icon: SlidersHorizontal },
     { id: 'evaluation', label: 'Evaluation & Fit', icon: BarChart3 },
     { id: 'providers', label: 'Providers & E5', icon: Cpu },
     { id: 'sdk', label: 'SDK & API', icon: Code2 },
@@ -516,6 +676,16 @@ export default function App() {
           </select>
         </div>
 
+        <label className="flex items-center justify-between gap-2 text-xs text-slate-700 cursor-pointer pt-0.5">
+          <span className="font-medium">MCP Stdio Server</span>
+          <input
+            type="checkbox"
+            checked={config.mcpEnabled}
+            onChange={(e) => void handleUpdateConfig({ mcpEnabled: e.target.checked })}
+            className="w-3.5 h-3.5 rounded border-slate-300 text-blue-600 focus:ring-blue-600"
+          />
+        </label>
+
         <button
           type="button"
           onClick={() => void handleResetWorkspace()}
@@ -628,9 +798,16 @@ export default function App() {
                   telemetry={telemetry}
                   telemetryStreamConnected={telemetryStreamConnected}
                   probingTelemetry={probingTelemetry}
+                  ragConnectors={ragConnectors}
+                  ragChunksCount={ragChunksCount}
                   onProbeHealth={handleProbeHealth}
                   onRunRoute={runRouteQuery}
+                  onCreateRagConnector={handleCreateRagConnector}
+                  onSyncRagConnector={handleSyncRagConnector}
+                  onToggleRagConnector={handleToggleRagConnector}
+                  onDeleteRagConnector={handleDeleteRagConnector}
                   onNavigateToRoutes={() => setActiveTab('routes')}
+                  onNavigateToInstructions={() => setActiveTab('instructions')}
                   onOpenChatGptAuth={() => setAuthModalOpen(true)}
                 />
               )}
@@ -648,6 +825,21 @@ export default function App() {
                   }}
                   onToggleRoute={handleToggleRoute}
                   onDeleteRoute={handleDeleteRoute}
+                />
+              )}
+
+              {activeTab === 'instructions' && (
+                <InstructionsView
+                  instructions={instructions}
+                  config={config}
+                  routes={routes}
+                  onSaveInstructions={handleSaveInstructions}
+                  onResetInstructions={handleResetInstructions}
+                  onRewarmEmbeddings={handleRewarmEmbeddings}
+                  onEditRoute={(route) => {
+                    setEditingRoute(route);
+                    setEditorOpen(true);
+                  }}
                 />
               )}
 
@@ -675,7 +867,19 @@ export default function App() {
                 />
               )}
 
-              {activeTab === 'sdk' && <SdkView routes={routes} config={config} />}
+              {activeTab === 'sdk' && (
+                <SdkView
+                  routes={routes}
+                  config={config}
+                  onToggleMcp={(enabled) => handleUpdateConfig({ mcpEnabled: enabled })}
+                />
+              )}
+
+              <ArchitectureBlueprintDrawer
+                knowledge={libraryKnowledge}
+                onSaveKnowledge={handleSaveLibraryKnowledge}
+                onResetKnowledge={handleResetLibraryKnowledge}
+              />
             </>
           )}
         </main>

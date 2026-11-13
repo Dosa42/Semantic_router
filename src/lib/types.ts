@@ -16,6 +16,11 @@ export interface FunctionSchema {
   parameters: FunctionParameter[];
 }
 
+export interface RouteInstructionOverride {
+  embeddingContextPrefix?: string;
+  chatgptSystemInstruction?: string;
+}
+
 export interface RouteDefinition {
   id: string;
   name: string;
@@ -26,7 +31,30 @@ export interface RouteDefinition {
   targetModel: string;
   enabled: boolean;
   functionSchema?: FunctionSchema;
+  instructionOverrides?: RouteInstructionOverride;
   createdAt: string;
+}
+
+export interface EmbeddingInstructionsConfig {
+  queryTemplate: string;
+  passageTemplate: string;
+  taskInstruction: string;
+  lowercaseInput: boolean;
+  stripExtraWhitespace: boolean;
+  maxChars: number;
+}
+
+export interface ChatGptInstructionsConfig {
+  responseSystemPrompt: string;
+  extractionSystemPrompt: string;
+  ragContextTemplate: string;
+  enforceCitations: boolean;
+  conciseMode: boolean;
+}
+
+export interface SystemInstructionsConfig {
+  embedding: EmbeddingInstructionsConfig;
+  chatgpt: ChatGptInstructionsConfig;
 }
 
 export interface RouterConfig {
@@ -35,6 +63,8 @@ export interface RouterConfig {
   aggregation: AggregationStrategy;
   defaultThreshold: number;
   encoderModel: EncoderModelId;
+  mcpEnabled: boolean;
+  ragEnabledByDefault: boolean;
 }
 
 export interface UtteranceMatch {
@@ -74,6 +104,57 @@ export interface ProviderExecutionResult {
   output: Record<string, unknown> | string;
 }
 
+export type RagParserMode = 'auto' | 'json' | 'text' | 'html';
+
+export interface RagConnector {
+  id: string;
+  name: string;
+  url: string;
+  method: 'GET' | 'POST';
+  headers?: Record<string, string>;
+  requestBody?: string;
+  parserMode: RagParserMode;
+  jsonPath?: string;
+  boundRouteIds: string[];
+  chunkSize: number;
+  chunkOverlap: number;
+  enabled: boolean;
+  lastSyncedAt: string | null;
+  lastStatus: 'idle' | 'ok' | 'error';
+  lastLatencyMs: number | null;
+  lastError: string | null;
+  chunkCount: number;
+}
+
+export interface RagChunk {
+  id: string;
+  connectorId: string;
+  connectorName: string;
+  sourceUrl: string;
+  text: string;
+  chunkIndex: number;
+  fetchedAt: string;
+}
+
+export interface RagRetrievalMatch {
+  chunkId: string;
+  connectorId: string;
+  connectorName: string;
+  sourceUrl: string;
+  text: string;
+  score: number;
+  denseScore: number;
+  sparseScore: number;
+}
+
+export interface RagQueryResult {
+  query: string;
+  matches: RagRetrievalMatch[];
+  latencyMs: number;
+  encoderUsed: string;
+  connectorCount: number;
+}
+
 export interface RouteDecisionResult {
   query: string;
   matchedRoute: string | null;
@@ -89,6 +170,11 @@ export interface RouteDecisionResult {
   aggregation: AggregationStrategy;
   functionCall: ExtractedFunctionCall | null;
   providerExecution?: ProviderExecutionResult | null;
+  ragMatches?: RagRetrievalMatch[];
+  appliedInstructions?: {
+    embeddingQueryPreview: string;
+    chatgptSystemPrompt: string | null;
+  };
   allScores: RouteScoreBreakdown[];
 }
 
@@ -236,7 +322,7 @@ export interface TelemetrySubsystemStatus {
 
 export interface TelemetryPortBinding {
   port: number;
-  protocol: 'HTTP' | 'HTTPS' | 'ONNX';
+  protocol: 'HTTP' | 'HTTPS' | 'ONNX' | 'STDIO' | 'IPC';
   service: string;
   state: 'listening' | 'standby' | 'egress' | 'ready' | 'warming' | 'error';
   detail: string;
@@ -272,15 +358,82 @@ export interface TelemetryTraceEvent {
   responseBody: unknown;
 }
 
+export type TelemetryEdgeId =
+  | 'browser->express'
+  | 'mcp->router'
+  | 'express->router'
+  | 'router->bridge'
+  | 'bridge->embedding'
+  | 'router->rag_connector'
+  | 'router->chatgpt'
+  | 'chatgpt->loopback';
+
+export interface TelemetryEdgeState {
+  id: TelemetryEdgeId;
+  from: string;
+  to: string;
+  label: string;
+  portOrChannel: string;
+  protocol: string;
+  activeCount: number;
+  lastStartedAtMs: number | null;
+  lastCompletedAtMs: number | null;
+  lastDurationMs: number | null;
+  hitCount: number;
+  lastStatus: 'ok' | 'error' | 'active' | 'idle';
+}
+
 export interface TelemetrySnapshot {
   timestamp: string;
   uptimeSec: number;
   expressPort: number;
   loopbackListening: boolean;
   loopbackPort: number | null;
+  mcpEnabled: boolean;
+  mcpCallCount: number;
+  ragConnectorCount: number;
+  ragChunkCount: number;
   activeFlowEdge: string | null;
+  edges: TelemetryEdgeState[];
   subsystems: TelemetrySubsystemStatus[];
   ports: TelemetryPortBinding[];
   endpoints: TelemetryEndpointMetric[];
   recentTraces: TelemetryTraceEvent[];
 }
+
+export interface McpStdioLogEntry {
+  id: string;
+  timestamp: string;
+  direction: 'stdin' | 'stdout';
+  method?: string;
+  rpcId?: string | number | null;
+  payload: unknown;
+  durationMs?: number;
+}
+
+export type ArchitectureSideId = 'semantic-router-studio' | 'torrent-rag-uagl';
+
+export interface ArchitectureBlueprint {
+  id: ArchitectureSideId;
+  title: string;
+  stackLabel: string;
+  summary: string;
+  portsAndProtocols: string[];
+  mermaidCode: string;
+}
+
+export interface ArchitectureComparisonRow {
+  dimension: string;
+  semanticRouterStudio: string;
+  torrentRagUagl: string;
+  sharedPattern: string;
+}
+
+export interface LibraryKnowledgeState {
+  version: string;
+  updatedAt: string;
+  notes: string;
+  blueprints: [ArchitectureBlueprint, ArchitectureBlueprint];
+  comparisonMatrix: ArchitectureComparisonRow[];
+}
+

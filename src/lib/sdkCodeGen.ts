@@ -77,6 +77,7 @@ export function generateTypeScriptSdkCode(config: RouterConfig): string {
   thresholdUsed: number | null;
   latencyMs: number;
   targetModel: string | null;
+  ragMatches?: Array<{ connectorName: string; score: number; text: string }>;
   functionCall: {
     name: string;
     arguments: Record<string, unknown>;
@@ -92,6 +93,7 @@ export async function routePrompt(query: string): Promise<RouteDecision> {
       mode: ${JSON.stringify(config.mode)},
       alpha: ${config.alpha.toFixed(2)},
       aggregation: ${JSON.stringify(config.aggregation)},
+      useRag: ${String(config.ragEnabledByDefault)},
     }),
   });
 
@@ -110,9 +112,101 @@ export function generateCurlSdkCode(config: RouterConfig): string {
     "query": "What is the current local time in Tokyo right now?",
     "mode": "${config.mode}",
     "alpha": ${config.alpha.toFixed(2)},
-    "aggregation": "${config.aggregation}"
+    "aggregation": "${config.aggregation}",
+    "useRag": ${String(config.ragEnabledByDefault)}
   }'`;
 }
+
+export function generateMcpClientConfigSnippet(): string {
+  return JSON.stringify(
+    {
+      mcpServers: {
+        'semantic-router-rag': {
+          command: 'npm',
+          args: ['run', 'mcp', '--silent'],
+          cwd: '/path/to/Semantic_router',
+          transport: 'stdio',
+        },
+      },
+    },
+    null,
+    2
+  );
+}
+
+export const MCP_JSONRPC_PRESETS: Array<{
+  label: string;
+  description: string;
+  payload: Record<string, unknown>;
+}> = [
+  {
+    label: 'initialize',
+    description: 'MCP handshake & capability negotiation',
+    payload: {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'studio-bridge', version: '1.0.0' },
+      },
+    },
+  },
+  {
+    label: 'tools/list',
+    description: 'Discover available Semantic Router & RAG MCP tools',
+    payload: {
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/list',
+      params: {},
+    },
+  },
+  {
+    label: 'tools/call · route_prompt',
+    description: 'Route SQL query with RAG augmentation over MCP stdio',
+    payload: {
+      jsonrpc: '2.0',
+      id: 3,
+      method: 'tools/call',
+      params: {
+        name: 'route_prompt',
+        arguments: {
+          query: 'Write a PostgreSQL query using window functions to rank customers',
+          useRag: true,
+          executeProvider: true,
+        },
+      },
+    },
+  },
+  {
+    label: 'tools/call · rag_retrieve',
+    description: 'Search synced RAG connector chunks directly',
+    payload: {
+      jsonrpc: '2.0',
+      id: 4,
+      method: 'tools/call',
+      params: {
+        name: 'rag_retrieve',
+        arguments: {
+          query: 'How does hybrid BM25 and e5-small-v2 scoring work?',
+          topK: 3,
+        },
+      },
+    },
+  },
+  {
+    label: 'resources/list',
+    description: 'List exposed router:// and rag:// MCP resources',
+    payload: {
+      jsonrpc: '2.0',
+      id: 5,
+      method: 'resources/list',
+      params: {},
+    },
+  },
+];
 
 function toValidPythonVar(name: string): string {
   const cleaned = name

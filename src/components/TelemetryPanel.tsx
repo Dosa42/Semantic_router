@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   Check,
@@ -7,6 +7,8 @@ import {
   Server,
 } from 'lucide-react';
 import type {
+  TelemetryEdgeId,
+  TelemetryEdgeState,
   TelemetryLampColor,
   TelemetrySnapshot,
   TelemetrySubsystemId,
@@ -23,6 +25,169 @@ interface TelemetryPanelProps {
 }
 
 type TelemetrySubTab = 'flow' | 'endpoints' | 'payloads';
+
+type AnchorSide = 'top' | 'bottom' | 'left' | 'right' | 'bottom-left' | 'bottom-right' | 'top-right';
+
+interface TopologyNodeDef {
+  id: string;
+  label: string;
+  sublabel: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  subsystem?: TelemetrySubsystemId;
+}
+
+interface TopologyEdgeDef {
+  id: TelemetryEdgeId;
+  from: string;
+  to: string;
+  fromSide: AnchorSide;
+  toSide: AnchorSide;
+  defaultPort: string;
+}
+
+const TOPOLOGY_NODES: TopologyNodeDef[] = [
+  { id: 'browser', label: 'Client Browser', sublabel: 'HTTP/SSE', x: 8, y: 8, w: 102, h: 36 },
+  {
+    id: 'express',
+    label: 'Express Gateway',
+    sublabel: ':3000 LISTEN',
+    x: 128,
+    y: 8,
+    w: 106,
+    h: 36,
+    subsystem: 'semantic_router',
+  },
+  { id: 'mcp', label: 'MCP Stdio', sublabel: 'stdin / stdout', x: 252, y: 8, w: 100, h: 36 },
+  {
+    id: 'router',
+    label: 'RAG & Semantic Router',
+    sublabel: 'Unified Core',
+    x: 92,
+    y: 74,
+    w: 176,
+    h: 40,
+    subsystem: 'semantic_router',
+  },
+  {
+    id: 'rag_connector',
+    label: 'RAG Webhook',
+    sublabel: ':443 Fetch',
+    x: 8,
+    y: 146,
+    w: 102,
+    h: 38,
+    subsystem: 'semantic_router',
+  },
+  {
+    id: 'chatgpt',
+    label: 'ChatGPT AI',
+    sublabel: ':443 Responses',
+    x: 128,
+    y: 146,
+    w: 106,
+    h: 38,
+    subsystem: 'ai_model',
+  },
+  {
+    id: 'bridge',
+    label: 'EmbeddingsBridge',
+    sublabel: 'IPC + Cache',
+    x: 252,
+    y: 146,
+    w: 100,
+    h: 38,
+    subsystem: 'embedding_model',
+  },
+  {
+    id: 'loopback',
+    label: 'OAuth Loopback',
+    sublabel: ':1455 PKCE',
+    x: 128,
+    y: 214,
+    w: 106,
+    h: 38,
+    subsystem: 'ai_model',
+  },
+  {
+    id: 'embedding',
+    label: 'Embedding LM',
+    sublabel: 'e5-small-v2',
+    x: 252,
+    y: 214,
+    w: 100,
+    h: 38,
+    subsystem: 'embedding_model',
+  },
+];
+
+const TOPOLOGY_EDGES: TopologyEdgeDef[] = [
+  { id: 'browser->express', from: 'browser', to: 'express', fromSide: 'right', toSide: 'left', defaultPort: ':3000' },
+  { id: 'express->router', from: 'express', to: 'router', fromSide: 'bottom', toSide: 'top', defaultPort: 'IPC' },
+  { id: 'mcp->router', from: 'mcp', to: 'router', fromSide: 'bottom', toSide: 'top-right', defaultPort: 'stdio' },
+  { id: 'router->rag_connector', from: 'router', to: 'rag_connector', fromSide: 'bottom-left', toSide: 'top', defaultPort: ':443' },
+  { id: 'router->chatgpt', from: 'router', to: 'chatgpt', fromSide: 'bottom', toSide: 'top', defaultPort: ':443' },
+  { id: 'router->bridge', from: 'router', to: 'bridge', fromSide: 'bottom-right', toSide: 'top', defaultPort: 'IPC' },
+  { id: 'chatgpt->loopback', from: 'chatgpt', to: 'loopback', fromSide: 'bottom', toSide: 'top', defaultPort: ':1455' },
+  { id: 'bridge->embedding', from: 'bridge', to: 'embedding', fromSide: 'bottom', toSide: 'top', defaultPort: 'ONNX' },
+];
+
+function getAnchorPoint(node: TopologyNodeDef, side: AnchorSide): { x: number; y: number } {
+  switch (side) {
+    case 'top':
+      return { x: node.x + node.w / 2, y: node.y };
+    case 'top-right':
+      return { x: node.x + node.w * 0.82, y: node.y };
+    case 'bottom':
+      return { x: node.x + node.w / 2, y: node.y + node.h };
+    case 'bottom-left':
+      return { x: node.x + node.w * 0.18, y: node.y + node.h };
+    case 'bottom-right':
+      return { x: node.x + node.w * 0.82, y: node.y + node.h };
+    case 'left':
+      return { x: node.x, y: node.y + node.h / 2 };
+    case 'right':
+      return { x: node.x + node.w, y: node.y + node.h / 2 };
+  }
+}
+
+function computeDynamicEdgeCurve(
+  fromNode: TopologyNodeDef,
+  toNode: TopologyNodeDef,
+  fromSide: AnchorSide,
+  toSide: AnchorSide
+): { path: string; midX: number; midY: number } {
+  const p1 = getAnchorPoint(fromNode, fromSide);
+  const p2 = getAnchorPoint(toNode, toSide);
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+
+  const isHorizontal = (fromSide === 'left' || fromSide === 'right') && (toSide === 'left' || toSide === 'right');
+  let c1x = p1.x;
+  let c1y = p1.y;
+  let c2x = p2.x;
+  let c2y = p2.y;
+
+  if (isHorizontal) {
+    c1x = p1.x + dx * 0.5;
+    c2x = p2.x - dx * 0.5;
+  } else {
+    c1y = p1.y + dy * 0.52;
+    c2y = p2.y - dy * 0.52;
+  }
+
+  // Exact cubic Bezier midpoint at t = 0.5
+  const midX = 0.125 * p1.x + 0.375 * c1x + 0.375 * c2x + 0.125 * p2.x;
+  const midY = 0.125 * p1.y + 0.375 * c1y + 0.375 * c2y + 0.125 * p2.y;
+
+  return {
+    path: `M ${p1.x.toFixed(1)} ${p1.y.toFixed(1)} C ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${c2x.toFixed(1)} ${c2y.toFixed(1)}, ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`,
+    midX,
+    midY,
+  };
+}
 
 function TrafficLightHousing({
   lamp,
@@ -88,11 +253,7 @@ function getPortStateClass(state: string): string {
   return 'text-rose-700';
 }
 
-function subsystemToNodeId(id: TelemetrySubsystemId): string {
-  if (id === 'ai_model') return 'openai-oauth-llm';
-  if (id === 'embedding_model') return 'e5-onnx-worker';
-  return 'semantic-router-rag';
-}
+const GLOW_DECAY_MS = 850;
 
 export function TelemetryPanel({
   telemetry,
@@ -105,6 +266,7 @@ export function TelemetryPanel({
   const [selectedSubsystem, setSelectedSubsystem] = useState<TelemetrySubsystemId | null>(null);
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null);
   const [copiedPayload, setCopiedPayload] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   const traces = telemetry?.recentTraces ?? [];
   const filteredTraces = selectedSubsystem
@@ -120,6 +282,29 @@ export function TelemetryPanel({
     }
   }, [filteredTraces, selectedTraceId]);
 
+  // Fast 60ms visual decay timer ONLY while any edge is active or within its 850ms glow window
+  const edges = telemetry?.edges ?? [];
+  const hasLiveOrDecayingEdge = edges.some(
+    (e) =>
+      e.activeCount > 0 ||
+      (e.lastCompletedAtMs !== null && Date.now() - e.lastCompletedAtMs < GLOW_DECAY_MS)
+  );
+
+  useEffect(() => {
+    if (!hasLiveOrDecayingEdge) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 60);
+    return () => window.clearInterval(id);
+  }, [hasLiveOrDecayingEdge, telemetry?.timestamp]);
+
+  const edgeMap = useMemo(() => {
+    const map = new Map<TelemetryEdgeId, TelemetryEdgeState>();
+    for (const e of edges) map.set(e.id, e);
+    return map;
+  }, [edges]);
+
   const subsystems: TelemetrySubsystemStatus[] = telemetry?.subsystems ?? [
     {
       id: 'ai_model',
@@ -133,17 +318,17 @@ export function TelemetryPanel({
     },
     {
       id: 'semantic_router',
-      label: 'Semantic Router',
-      target: 'RAG Index Engine',
+      label: 'Router & RAG',
+      target: 'HTTP + MCP Engine',
       lamp: 'yellow',
       statusText: 'SYNC',
       detail: 'Loading route index',
-      portOrRuntime: ':3000 HTTP',
+      portOrRuntime: ':3000 + stdio',
       lastLatencyMs: null,
     },
     {
       id: 'embedding_model',
-      label: 'Embedding Model',
+      label: 'Embedding LM',
       target: 'e5-small-v2',
       lamp: 'yellow',
       statusText: 'SYNC',
@@ -158,13 +343,54 @@ export function TelemetryPanel({
   );
   const ports = telemetry?.ports ?? [];
 
-  const highlightedNode = selectedSubsystem
-    ? subsystemToNodeId(selectedSubsystem)
-    : telemetry?.activeFlowEdge ?? 'semantic-router-rag';
-
   const aiSub = subsystems.find((s) => s.id === 'ai_model');
   const routerSub = subsystems.find((s) => s.id === 'semantic_router');
   const embedSub = subsystems.find((s) => s.id === 'embedding_model');
+
+  const nodeMap = useMemo(() => {
+    const map = new Map<string, TopologyNodeDef>();
+    for (const n of TOPOLOGY_NODES) map.set(n.id, n);
+    return map;
+  }, []);
+
+  const computedEdges = useMemo(() => {
+    return TOPOLOGY_EDGES.map((def) => {
+      const fromNode = nodeMap.get(def.from)!;
+      const toNode = nodeMap.get(def.to)!;
+      const curve = computeDynamicEdgeCurve(fromNode, toNode, def.fromSide, def.toSide);
+      const state = edgeMap.get(def.id);
+      const isInFlight = (state?.activeCount ?? 0) > 0;
+      const ageMs =
+        state?.lastCompletedAtMs !== null && state?.lastCompletedAtMs !== undefined
+          ? Math.max(0, nowMs - state.lastCompletedAtMs)
+          : Infinity;
+      const isDecaying = !isInFlight && ageMs < GLOW_DECAY_MS;
+      const isGlowing = isInFlight || isDecaying;
+      const isError = state?.lastStatus === 'error' && isDecaying;
+      const portLabel = state?.portOrChannel ?? def.defaultPort;
+      const latencyLabel = isInFlight
+        ? 'LIVE'
+        : isDecaying && state?.lastDurationMs !== null && state?.lastDurationMs !== undefined
+          ? `${state.lastDurationMs.toFixed(1)}ms`
+          : null;
+
+      return {
+        def,
+        state,
+        curve,
+        isInFlight,
+        isGlowing,
+        isError,
+        portLabel,
+        latencyLabel,
+      };
+    });
+  }, [edgeMap, nodeMap, nowMs]);
+
+  const activeEdgeSummary = computedEdges
+    .filter((e) => e.isGlowing)
+    .map((e) => `${e.def.id} (${e.portLabel})`)
+    .join(', ');
 
   const handleCopyTraceJson = async () => {
     if (!activeTrace) return;
@@ -226,7 +452,7 @@ export function TelemetryPanel({
         </button>
       </div>
 
-      {/* Three Traffic-Light Subsystems (Left: AI Model | Middle: Semantic Router | Right: Embedding Model) */}
+      {/* Three Traffic-Light Subsystems */}
       <div className="p-4 space-y-2.5">
         <div className="flex items-center justify-between text-xs">
           <span className="font-medium text-slate-700">Subsystem Signal Matrix</span>
@@ -239,7 +465,7 @@ export function TelemetryPanel({
               Show All Subsystems
             </button>
           ) : (
-            <span className="text-[11px] text-slate-500">Click unit to filter routes</span>
+            <span className="text-[11px] text-slate-500">Click unit to filter</span>
           )}
         </div>
 
@@ -290,7 +516,7 @@ export function TelemetryPanel({
             .map((s) => (
               <div key={s.id} className="flex items-center justify-between gap-2">
                 <span className="font-medium text-slate-800 shrink-0">{s.label}:</span>
-                <span className="truncate font-mono text-[10px] text-slate-600 flex-1 text-right">
+                <span className="truncate font-mono text-[10px] text-slate-600 flex-1 text-right tabular-nums">
                   {s.detail}
                   {s.lastLatencyMs !== null ? ` (${s.lastLatencyMs.toFixed(1)} ms)` : ''}
                 </span>
@@ -349,312 +575,221 @@ export function TelemetryPanel({
       <div className="p-4">
         {subTab === 'flow' && (
           <div className="space-y-4">
-            {/* Network API Route Topology Diagram */}
+            {/* Dynamic Millisecond-Glowing Network & Process Topology */}
             <div>
-              <div className="flex items-center justify-between text-xs mb-2">
-                <span className="font-semibold text-slate-800">Network API Route Flow</span>
-                <span className="font-mono text-[10px] text-slate-500">
-                  Active edge: {highlightedNode}
+              <div className="flex items-center justify-between gap-2 text-xs mb-2">
+                <span className="font-semibold text-slate-800 shrink-0">
+                  Live Process &amp; Port Flow
+                </span>
+                <span className="font-mono text-[10px] text-slate-500 truncate tabular-nums">
+                  {activeEdgeSummary || 'Idle · awaiting port activity'}
                 </span>
               </div>
 
-              <div className="bg-slate-50 border border-slate-200 rounded-md p-2.5">
+              <div className="bg-slate-950 border border-slate-800 rounded-md p-2">
                 <svg
-                  viewBox="0 0 360 176"
+                  viewBox="0 0 360 262"
                   className="w-full h-auto"
                   role="img"
-                  aria-label="Live network API routing diagram across browser, Express port 3000, AI Model, Semantic Router RAG, and Embedding Model"
+                  aria-label="Dynamic millisecond-live network topology across Browser, MCP stdio, Express Gateway, RAG Semantic Router, EmbeddingsBridge, Embedding LM, RAG Webhook, ChatGPT AI, and OAuth Loopback"
                 >
                   <defs>
+                    <filter id="port-glow-blue" x="-30%" y="-30%" width="160%" height="160%">
+                      <feGaussianBlur stdDeviation="2.2" result="blur" />
+                      <feMerge>
+                        <feMergeNode in="blur" />
+                        <feMergeNode in="SourceGraphic" />
+                      </feMerge>
+                    </filter>
+                    <filter id="port-glow-amber" x="-30%" y="-30%" width="160%" height="160%">
+                      <feGaussianBlur stdDeviation="2.2" result="blur" />
+                      <feMerge>
+                        <feMergeNode in="blur" />
+                        <feMergeNode in="SourceGraphic" />
+                      </feMerge>
+                    </filter>
+                    <filter id="port-glow-rose" x="-30%" y="-30%" width="160%" height="160%">
+                      <feGaussianBlur stdDeviation="2.2" result="blur" />
+                      <feMerge>
+                        <feMergeNode in="blur" />
+                        <feMergeNode in="SourceGraphic" />
+                      </feMerge>
+                    </filter>
                     <marker
-                      id="flow-arrow-muted"
-                      viewBox="0 0 10 10"
-                      refX="8"
-                      refY="5"
-                      markerWidth="5"
-                      markerHeight="5"
+                      id="dyn-arrow-idle"
+                      viewBox="0 0 8 8"
+                      refX="6.5"
+                      refY="4"
+                      markerWidth="4.5"
+                      markerHeight="4.5"
                       orient="auto-start-reverse"
                     >
-                      <path d="M 0 1 L 8 5 L 0 9 z" fill="#94A3B8" />
+                      <path d="M 0 1 L 7 4 L 0 7 z" fill="#475569" />
                     </marker>
                     <marker
-                      id="flow-arrow-active"
-                      viewBox="0 0 10 10"
-                      refX="8"
-                      refY="5"
+                      id="dyn-arrow-glow"
+                      viewBox="0 0 8 8"
+                      refX="6.5"
+                      refY="4"
                       markerWidth="5"
                       markerHeight="5"
                       orient="auto-start-reverse"
                     >
-                      <path d="M 0 1 L 8 5 L 0 9 z" fill="#2563EB" />
+                      <path d="M 0 1 L 7 4 L 0 7 z" fill="#38BDF8" />
+                    </marker>
+                    <marker
+                      id="dyn-arrow-error"
+                      viewBox="0 0 8 8"
+                      refX="6.5"
+                      refY="4"
+                      markerWidth="5"
+                      markerHeight="5"
+                      orient="auto-start-reverse"
+                    >
+                      <path d="M 0 1 L 7 4 L 0 7 z" fill="#FB7185" />
                     </marker>
                   </defs>
 
-                  {/* Top Node: Browser UI -> Express Gateway */}
-                  <rect
-                    x="14"
-                    y="10"
-                    width="116"
-                    height="36"
-                    rx="5"
-                    fill="#FFFFFF"
-                    stroke="#CBD5E1"
-                  />
-                  <text
-                    x="72"
-                    y="25"
-                    textAnchor="middle"
-                    fill="#0F172A"
-                    fontSize="10"
-                    fontWeight="600"
-                    fontFamily="Plus Jakarta Sans, sans-serif"
-                  >
-                    Client Browser
-                  </text>
-                  <text
-                    x="72"
-                    y="38"
-                    textAnchor="middle"
-                    fill="#64748B"
-                    fontSize="9"
-                    fontFamily="JetBrains Mono, monospace"
-                  >
-                    HTTP/SSE :3000
-                  </text>
+                  {/* Dynamically Computed Connection Lines */}
+                  {computedEdges.map(({ def, curve, isInFlight, isGlowing, isError, portLabel, latencyLabel }) => {
+                    const strokeColor = isError
+                      ? '#FB7185'
+                      : isInFlight
+                        ? '#38BDF8'
+                        : isGlowing
+                          ? '#60A5FA'
+                          : '#334155';
+                    const marker = isError
+                      ? 'url(#dyn-arrow-error)'
+                      : isGlowing
+                        ? 'url(#dyn-arrow-glow)'
+                        : 'url(#dyn-arrow-idle)';
+                    const glowFilter = isError
+                      ? 'url(#port-glow-rose)'
+                      : isInFlight
+                        ? 'url(#port-glow-blue)'
+                        : isGlowing
+                          ? 'url(#port-glow-blue)'
+                          : undefined;
 
-                  <line
-                    x1="130"
-                    y1="28"
-                    x2="196"
-                    y2="28"
-                    stroke="#2563EB"
-                    strokeWidth="1.6"
-                    markerEnd="url(#flow-arrow-active)"
-                  />
-                  <text
-                    x="163"
-                    y="22"
-                    textAnchor="middle"
-                    fill="#2563EB"
-                    fontSize="8.5"
-                    fontFamily="JetBrains Mono, monospace"
-                  >
-                    /api/*
-                  </text>
+                    return (
+                      <g key={def.id} data-edge-id={def.id} data-edge-active={isGlowing ? 'true' : 'false'}>
+                        {/* Base thin 1px structural line */}
+                        <path
+                          d={curve.path}
+                          fill="none"
+                          stroke={strokeColor}
+                          strokeWidth={isGlowing ? 1.35 : 0.9}
+                          strokeOpacity={isGlowing ? 0.95 : 0.7}
+                          filter={glowFilter}
+                          markerEnd={marker}
+                        />
+                        {/* Animated thin data-flow filament only when actively running or decaying */}
+                        {isGlowing && (
+                          <path
+                            d={curve.path}
+                            fill="none"
+                            stroke={isError ? '#FDA4AF' : '#E0F2FE'}
+                            strokeWidth={1.1}
+                            strokeDasharray="4 6"
+                            className="motion-reduce:hidden"
+                          >
+                            <animate
+                              attributeName="stroke-dashoffset"
+                              from="20"
+                              to="0"
+                              dur={isInFlight ? '0.35s' : '0.6s'}
+                              repeatCount="indefinite"
+                            />
+                          </path>
+                        )}
+                        {/* Port / Latency micro-readout along active edge */}
+                        <text
+                          x={curve.midX}
+                          y={curve.midY - 3}
+                          textAnchor="middle"
+                          fill={isGlowing ? (isError ? '#FDA4AF' : '#7DD3FC') : '#64748B'}
+                          fontSize="6.8"
+                          fontWeight={isGlowing ? '600' : '400'}
+                          fontFamily="JetBrains Mono, monospace"
+                        >
+                          {latencyLabel ? `${portLabel} · ${latencyLabel}` : portLabel}
+                        </text>
+                      </g>
+                    );
+                  })}
 
-                  <rect
-                    x="202"
-                    y="10"
-                    width="144"
-                    height="36"
-                    rx="5"
-                    fill="#FFFFFF"
-                    stroke="#2563EB"
-                    strokeWidth="1.3"
-                  />
-                  <text
-                    x="274"
-                    y="25"
-                    textAnchor="middle"
-                    fill="#0F172A"
-                    fontSize="10"
-                    fontWeight="600"
-                    fontFamily="Plus Jakarta Sans, sans-serif"
-                  >
-                    Express API Gateway
-                  </text>
-                  <text
-                    x="274"
-                    y="38"
-                    textAnchor="middle"
-                    fill="#2563EB"
-                    fontSize="9"
-                    fontFamily="JetBrains Mono, monospace"
-                  >
-                    0.0.0.0:{telemetry?.expressPort ?? 3000} LISTEN
-                  </text>
+                  {/* Process & Service Nodes */}
+                  {TOPOLOGY_NODES.map((node) => {
+                    const connectedGlowing = computedEdges.some(
+                      (e) => e.isGlowing && (e.def.from === node.id || e.def.to === node.id)
+                    );
+                    const connectedError = computedEdges.some(
+                      (e) => e.isError && (e.def.from === node.id || e.def.to === node.id)
+                    );
+                    const subsystemSelected =
+                      selectedSubsystem && node.subsystem === selectedSubsystem;
 
-                  {/* Connector lines to 3 subsystems */}
-                  <path
-                    d="M 230 46 C 230 78, 60 72, 60 108"
-                    fill="none"
-                    stroke={highlightedNode === 'openai-oauth-llm' ? '#2563EB' : '#CBD5E1'}
-                    strokeWidth={highlightedNode === 'openai-oauth-llm' ? 1.8 : 1.2}
-                    markerEnd={
-                      highlightedNode === 'openai-oauth-llm'
-                        ? 'url(#flow-arrow-active)'
-                        : 'url(#flow-arrow-muted)'
+                    let dynamicSub = node.sublabel;
+                    if (node.id === 'express') {
+                      dynamicSub = `0.0.0.0:${telemetry?.expressPort ?? 3000}`;
+                    } else if (node.id === 'mcp') {
+                      dynamicSub = telemetry?.mcpEnabled === false ? 'disabled' : 'stdin/stdout';
+                    } else if (node.id === 'loopback') {
+                      dynamicSub = `:${telemetry?.loopbackPort ?? 1455} ${telemetry?.loopbackListening ? 'LISTEN' : 'IDLE'}`;
+                    } else if (node.id === 'embedding') {
+                      dynamicSub =
+                        telemetry?.subsystems.find((s) => s.id === 'embedding_model')?.target ??
+                        'e5-small-v2';
+                    } else if (node.id === 'chatgpt') {
+                      dynamicSub = `:443 ${aiSub?.statusText ?? 'STANDBY'}`;
+                    } else if (node.id === 'router') {
+                      dynamicSub = `${telemetry?.ragChunkCount ?? 0} chunks · ${routerSub?.statusText ?? 'ONLINE'}`;
                     }
-                  />
-                  <path
-                    d="M 274 46 C 274 76, 180 74, 180 108"
-                    fill="none"
-                    stroke={highlightedNode === 'semantic-router-rag' ? '#2563EB' : '#CBD5E1'}
-                    strokeWidth={highlightedNode === 'semantic-router-rag' ? 1.8 : 1.2}
-                    markerEnd={
-                      highlightedNode === 'semantic-router-rag'
-                        ? 'url(#flow-arrow-active)'
-                        : 'url(#flow-arrow-muted)'
-                    }
-                  />
-                  <path
-                    d="M 314 46 C 314 78, 300 72, 300 108"
-                    fill="none"
-                    stroke={highlightedNode === 'e5-onnx-worker' ? '#2563EB' : '#CBD5E1'}
-                    strokeWidth={highlightedNode === 'e5-onnx-worker' ? 1.8 : 1.2}
-                    markerEnd={
-                      highlightedNode === 'e5-onnx-worker'
-                        ? 'url(#flow-arrow-active)'
-                        : 'url(#flow-arrow-muted)'
-                    }
-                  />
 
-                  {/* Downstream Node 1: AI Model */}
-                  <rect
-                    x="8"
-                    y="112"
-                    width="104"
-                    height="52"
-                    rx="5"
-                    fill="#FFFFFF"
-                    stroke={highlightedNode === 'openai-oauth-llm' ? '#2563EB' : '#CBD5E1'}
-                    strokeWidth={highlightedNode === 'openai-oauth-llm' ? 1.5 : 1}
-                  />
-                  <text
-                    x="60"
-                    y="128"
-                    textAnchor="middle"
-                    fill="#0F172A"
-                    fontSize="9.5"
-                    fontWeight="600"
-                  >
-                    AI Model
-                  </text>
-                  <text
-                    x="60"
-                    y="141"
-                    textAnchor="middle"
-                    fill="#475569"
-                    fontSize="8.5"
-                    fontFamily="JetBrains Mono, monospace"
-                  >
-                    :443 / :{telemetry?.loopbackPort ?? 1455}
-                  </text>
-                  <text
-                    x="60"
-                    y="154"
-                    textAnchor="middle"
-                    fill={
-                      aiSub?.lamp === 'green'
-                        ? '#15803D'
-                        : aiSub?.lamp === 'yellow'
-                          ? '#B45309'
-                          : '#BE123C'
-                    }
-                    fontSize="8.5"
-                    fontWeight="600"
-                    fontFamily="JetBrains Mono, monospace"
-                  >
-                    {aiSub?.statusText ?? 'AUTH_REQ'}
-                  </text>
+                    const stroke = connectedError
+                      ? '#FB7185'
+                      : connectedGlowing || subsystemSelected
+                        ? '#38BDF8'
+                        : '#334155';
 
-                  {/* Downstream Node 2: Semantic Router RAG */}
-                  <rect
-                    x="124"
-                    y="112"
-                    width="112"
-                    height="52"
-                    rx="5"
-                    fill="#FFFFFF"
-                    stroke={highlightedNode === 'semantic-router-rag' ? '#2563EB' : '#CBD5E1'}
-                    strokeWidth={highlightedNode === 'semantic-router-rag' ? 1.5 : 1}
-                  />
-                  <text
-                    x="180"
-                    y="128"
-                    textAnchor="middle"
-                    fill="#0F172A"
-                    fontSize="9.5"
-                    fontWeight="600"
-                  >
-                    Semantic Router
-                  </text>
-                  <text
-                    x="180"
-                    y="141"
-                    textAnchor="middle"
-                    fill="#475569"
-                    fontSize="8.5"
-                    fontFamily="JetBrains Mono, monospace"
-                  >
-                    RAG Hybrid Index
-                  </text>
-                  <text
-                    x="180"
-                    y="154"
-                    textAnchor="middle"
-                    fill={
-                      routerSub?.lamp === 'green'
-                        ? '#15803D'
-                        : routerSub?.lamp === 'yellow'
-                          ? '#B45309'
-                          : '#BE123C'
-                    }
-                    fontSize="8.5"
-                    fontWeight="600"
-                    fontFamily="JetBrains Mono, monospace"
-                  >
-                    {routerSub?.statusText ?? 'ONLINE'}
-                  </text>
-
-                  {/* Downstream Node 3: Embedding Model */}
-                  <rect
-                    x="248"
-                    y="112"
-                    width="104"
-                    height="52"
-                    rx="5"
-                    fill="#FFFFFF"
-                    stroke={highlightedNode === 'e5-onnx-worker' ? '#2563EB' : '#CBD5E1'}
-                    strokeWidth={highlightedNode === 'e5-onnx-worker' ? 1.5 : 1}
-                  />
-                  <text
-                    x="300"
-                    y="128"
-                    textAnchor="middle"
-                    fill="#0F172A"
-                    fontSize="9.5"
-                    fontWeight="600"
-                  >
-                    Embeddings
-                  </text>
-                  <text
-                    x="300"
-                    y="141"
-                    textAnchor="middle"
-                    fill="#475569"
-                    fontSize="8.5"
-                    fontFamily="JetBrains Mono, monospace"
-                  >
-                    e5-small-v2 q8
-                  </text>
-                  <text
-                    x="300"
-                    y="154"
-                    textAnchor="middle"
-                    fill={
-                      embedSub?.lamp === 'green'
-                        ? '#15803D'
-                        : embedSub?.lamp === 'yellow'
-                          ? '#B45309'
-                          : '#BE123C'
-                    }
-                    fontSize="8.5"
-                    fontWeight="600"
-                    fontFamily="JetBrains Mono, monospace"
-                  >
-                    {embedSub?.statusText ?? 'WARMING'}
-                  </text>
+                    return (
+                      <g key={node.id} data-node-id={node.id}>
+                        <rect
+                          x={node.x}
+                          y={node.y}
+                          width={node.w}
+                          height={node.h}
+                          rx="4"
+                          fill={connectedGlowing ? '#0F172A' : '#0B1220'}
+                          stroke={stroke}
+                          strokeWidth={connectedGlowing || subsystemSelected ? 1.25 : 0.9}
+                          filter={connectedGlowing ? 'url(#port-glow-blue)' : undefined}
+                        />
+                        <text
+                          x={node.x + node.w / 2}
+                          y={node.y + 14.5}
+                          textAnchor="middle"
+                          fill="#F8FAFC"
+                          fontSize="8.3"
+                          fontWeight="600"
+                          fontFamily="Plus Jakarta Sans, sans-serif"
+                        >
+                          {node.label}
+                        </text>
+                        <text
+                          x={node.x + node.w / 2}
+                          y={node.y + 27.5}
+                          textAnchor="middle"
+                          fill={connectedGlowing ? '#7DD3FC' : '#94A3B8'}
+                          fontSize="7.1"
+                          fontFamily="JetBrains Mono, monospace"
+                        >
+                          {dynamicSub}
+                        </text>
+                      </g>
+                    );
+                  })}
                 </svg>
               </div>
             </div>
@@ -669,8 +804,8 @@ export function TelemetryPanel({
                 <table className="w-full text-left border-collapse text-[11px]">
                   <thead>
                     <tr className="bg-slate-50 border-b border-slate-200 text-slate-600">
-                      <th className="py-1.5 px-2.5 font-semibold">Port</th>
-                      <th className="py-1.5 px-2.5 font-semibold">Service</th>
+                      <th className="py-1.5 px-2.5 font-semibold">Port / Channel</th>
+                      <th className="py-1.5 px-2.5 font-semibold">Process</th>
                       <th className="py-1.5 px-2.5 font-semibold text-right">State</th>
                     </tr>
                   </thead>
@@ -678,11 +813,11 @@ export function TelemetryPanel({
                     {ports.map((p, idx) => (
                       <tr key={idx} className="bg-white">
                         <td className="py-1.5 px-2.5 font-mono tabular-nums font-medium text-slate-900 whitespace-nowrap">
-                          {p.port > 0 ? `:${p.port}` : 'IPC'} · {p.protocol}
+                          {p.port > 0 ? `:${p.port}` : p.protocol} · {p.protocol}
                         </td>
                         <td className="py-1.5 px-2.5 text-slate-700">
-                          <div className="font-medium truncate max-w-[175px]">{p.service}</div>
-                          <div className="font-mono text-[10px] text-slate-500 truncate max-w-[175px]">
+                          <div className="font-medium truncate max-w-[165px]">{p.service}</div>
+                          <div className="font-mono text-[10px] text-slate-500 truncate max-w-[165px]">
                             {p.detail}
                           </div>
                         </td>
