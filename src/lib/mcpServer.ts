@@ -151,6 +151,30 @@ export const MCP_TOOL_DEFINITIONS = [
       required: ['content'],
     },
   },
+  {
+    name: 'get_project_progress',
+    description:
+      'Inspect current EM-3 milestone completion progress, active focus milestone, and shared AgentState route overrides.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
+  {
+    name: 'evaluate_project_progress',
+    description:
+      'Evaluate an agent/LLM output against project milestones via EM-3 (BAAI/bge-m3) and update completion state.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        outputText: {
+          type: 'string',
+          description: 'Generated output text to score against active milestones',
+        },
+      },
+      required: ['outputText'],
+    },
+  },
 ];
 
 export class McpStdioServer {
@@ -388,6 +412,24 @@ export class McpStdioServer {
         };
       }
 
+      if (toolName === 'get_project_progress') {
+        const progressState = this.opts.service.getProgressState();
+        const agentState = this.opts.service.getAgentStateSnapshot();
+        return {
+          content: [{ type: 'text', text: JSON.stringify({ progressState, agentState }, null, 2) }],
+          structuredContent: { progressState, agentState },
+        };
+      }
+
+      if (toolName === 'evaluate_project_progress') {
+        const outputText = String(args.outputText ?? '').trim();
+        const result = await this.opts.service.evaluateProgressOutput(outputText);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+        };
+      }
+
       throw new Error(`Unknown MCP tool: ${toolName}`);
     }
 
@@ -419,6 +461,11 @@ export class McpStdioServer {
             name: 'TRINITY :7700 Core Health & UAGL Stats',
             mimeType: 'application/json',
           },
+          {
+            uri: 'progress://state',
+            name: 'EM-3 Project Milestone Progress & Agent State',
+            mimeType: 'application/json',
+          },
         ],
       };
     }
@@ -431,6 +478,12 @@ export class McpStdioServer {
       else if (uri === 'rag://connectors') data = this.opts.service.getRagConnectors();
       else if (uri === 'rag://chunks') data = this.opts.service.getRagChunks();
       else if (uri === 'trinity://health') data = await this.opts.service.getTrinityHealth();
+      else if (uri === 'progress://state') {
+        data = {
+          progressState: this.opts.service.getProgressState(),
+          agentState: this.opts.service.getAgentStateSnapshot(),
+        };
+      }
       else throw new Error(`Unknown resource URI: ${uri}`);
 
       return {

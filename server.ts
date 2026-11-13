@@ -17,6 +17,7 @@ import type {
   EncoderModelId,
   LibraryKnowledgeState,
   OpenAiFlowMode,
+  ProjectMilestone,
   RagConnector,
   RouteDefinition,
   RouterConfig,
@@ -451,6 +452,57 @@ async function startServer() {
   app.post('/api/embeddings/rewarm', async (_req, res) => {
     await service.warmUpEmbeddings();
     res.json({ ok: true, ...service.getProvidersMetadata() });
+  });
+
+  // --- EM-3 Project Progress Tracker & Shared Agent State API ---
+
+  app.get('/api/progress', (_req, res) => {
+    res.json({
+      progressState: service.getProgressState(),
+      agentState: service.getAgentStateSnapshot(),
+    });
+  });
+
+  app.put('/api/progress/milestones', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as { milestones?: ProjectMilestone[] };
+      const milestones = Array.isArray(body.milestones) ? body.milestones : [];
+      const progressState = await service.setMilestones(milestones);
+      res.json({
+        progressState,
+        agentState: service.getAgentStateSnapshot(),
+      });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post('/api/progress/evaluate', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as { outputText?: string };
+      const outputText = (body.outputText ?? '').trim();
+      if (!outputText) {
+        res.status(400).json({ error: 'outputText is required.' });
+        return;
+      }
+      const result = await service.evaluateProgressOutput(outputText);
+      res.json({
+        progressState: result.state,
+        newlyCompleted: result.newlyCompleted,
+        autoAdvanceRoute: result.autoAdvanceRoute,
+        agentState: result.agentState,
+      });
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+    }
+  });
+
+  app.get('/api/agent-state', (_req, res) => {
+    res.json({ agentState: service.getAgentStateSnapshot() });
+  });
+
+  app.post('/api/agent-state/clear-override', (_req, res) => {
+    res.json({ agentState: service.clearAgentRouteOverride() });
   });
 
   // --- Architecture Library Knowledge API ---

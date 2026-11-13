@@ -1,7 +1,32 @@
 export type RouteType = 'static' | 'dynamic';
 export type RoutingMode = 'hybrid' | 'dense' | 'sparse';
 export type AggregationStrategy = 'max' | 'mean' | 'top_k_mean';
-export type EncoderModelId = 'e5-small-v2' | 'local-subword-bm25';
+export type EncoderModelId = 'e5-small-v2' | 'local-subword-bm25' | 'bge-m3';
+export type EmbeddingSlotRole = 'intent' | 'domain' | 'state';
+export type EnsembleFusionMode = 'weighted_sum' | 'max' | 'cascade';
+
+export interface EmbeddingSlotConfig {
+  modelId: EncoderModelId;
+  role: EmbeddingSlotRole;
+  weight: number; // 0-1, used in weighted_sum and cascade modes
+  enabled: boolean;
+}
+
+export interface EnsembleConfig {
+  slots: [EmbeddingSlotConfig, EmbeddingSlotConfig, EmbeddingSlotConfig];
+  fusionMode: EnsembleFusionMode;
+  parallelLoad: boolean;
+}
+
+export interface EnsembleSlotRuntimeStatus {
+  role: EmbeddingSlotRole;
+  modelId: EncoderModelId;
+  status: 'idle' | 'loading' | 'ready' | 'error';
+  dimensions: number;
+  cachedCount: number;
+  lastLatencyMs: number | null;
+  backend: 'onnx' | 'local-fallback';
+}
 
 export interface FunctionParameter {
   name: string;
@@ -63,6 +88,7 @@ export interface RouterConfig {
   aggregation: AggregationStrategy;
   defaultThreshold: number;
   encoderModel: EncoderModelId;
+  encoderEnsemble?: EnsembleConfig;
   mcpEnabled: boolean;
   ragEnabledByDefault: boolean;
 }
@@ -87,6 +113,8 @@ export interface RouteScoreBreakdown {
   margin: number;
   topUtterance: string;
   utteranceMatches: UtteranceMatch[];
+  perEncoderScores?: Partial<Record<EmbeddingSlotRole, number>>;
+  ensembleFusedScore?: number;
 }
 
 export interface ExtractedFunctionCall {
@@ -176,6 +204,54 @@ export interface RouteDecisionResult {
     chatgptSystemPrompt: string | null;
   };
   allScores: RouteScoreBreakdown[];
+  perEncoderBreakdown?: Partial<Record<EmbeddingSlotRole, RouteScoreBreakdown[]>>;
+  ensembleFusionMode?: EnsembleFusionMode;
+  progressAutoAdvanceRoute?: string | null;
+}
+
+export interface ProjectMilestone {
+  id: string;
+  label: string;
+  description: string;
+  completionThreshold: number; // cosine similarity required (e.g. 0.85)
+  targetRouteHint?: string; // optional route name auto-advance hint
+  embeddingVec?: number[]; // set after EM-3 encodes the description
+}
+
+export interface MilestoneProgress {
+  milestoneId: string;
+  label: string;
+  score: number; // cosine sim between current output and this milestone
+  completed: boolean;
+  completedAt?: string;
+}
+
+export interface ProjectProgressState {
+  sessionId: string;
+  milestones: ProjectMilestone[];
+  progress: MilestoneProgress[];
+  overallProgress: number; // mean of scores, 0-1
+  currentFocusId: string | null; // milestone with highest active score
+  lastOutputPreview?: string;
+  lastStateVecPreview?: number[];
+  lastUpdatedAt: string;
+}
+
+export interface AgentStateMemoryEntry {
+  id: string;
+  timestamp: string;
+  source: 'progress_tracker' | 'router' | 'manual';
+  message: string;
+  milestoneId?: string | null;
+  score?: number;
+}
+
+export interface AgentStateSnapshot {
+  currentFocusId: string | null;
+  routeOverride: string | null;
+  lastCompletedMilestoneId: string | null;
+  sessionMemoryLog: AgentStateMemoryEntry[];
+  values: Record<string, unknown>;
 }
 
 export interface EvalCase {
@@ -307,7 +383,14 @@ export interface ChatGptModelInfo {
 }
 
 export type TelemetryLampColor = 'green' | 'yellow' | 'red';
-export type TelemetrySubsystemId = 'ai_model' | 'semantic_router' | 'embedding_model';
+export type TelemetrySubsystemId =
+  | 'ai_model'
+  | 'semantic_router'
+  | 'embedding_model'
+  | 'embedding_intent'
+  | 'embedding_domain'
+  | 'embedding_state'
+  | 'ensemble_fusion';
 
 export interface TelemetrySubsystemStatus {
   id: TelemetrySubsystemId;
@@ -364,6 +447,14 @@ export type TelemetryEdgeId =
   | 'express->router'
   | 'router->bridge'
   | 'bridge->embedding'
+  | 'router->embedding_intent'
+  | 'router->embedding_domain'
+  | 'router->embedding_state'
+  | 'embedding_intent->ensemble'
+  | 'embedding_domain->ensemble'
+  | 'embedding_state->ensemble'
+  | 'ensemble->router'
+  | 'embedding_state->progress_tracker'
   | 'router->rag_connector'
   | 'router->chatgpt'
   | 'chatgpt->loopback';
@@ -393,6 +484,8 @@ export interface TelemetrySnapshot {
   mcpCallCount: number;
   ragConnectorCount: number;
   ragChunkCount: number;
+  ensembleActive?: boolean;
+  progressOverall?: number;
   activeFlowEdge: string | null;
   edges: TelemetryEdgeState[];
   subsystems: TelemetrySubsystemStatus[];

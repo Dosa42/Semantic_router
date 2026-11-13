@@ -1,7 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { AgentStateStore } from './agentState.ts';
 import type { ChatGptAuthManager } from './chatgptAuth.ts';
+import { EmbeddingEnsembleRunner } from './embeddingEnsemble.ts';
 import { formatEmbeddingText, resolveChatGptSystemPrompt } from './instructions.ts';
+import { ProjectProgressTracker } from './progressTracker.ts';
 import {
   ENCODER_PROVIDERS,
   executeLocalProviderFunction,
@@ -14,26 +17,35 @@ import {
   queryTrinityRag,
 } from './trinityBridge.ts';
 import {
+  computeLocalDenseVector,
   createLocalVectorLookup,
   evaluateDataset,
   extractDynamicParametersLocal,
   optimizeRouteThresholds,
   scoreRoutes,
+  scoreRoutesEnsemble,
+  type EnsembleSlotLookup,
   type VectorLookup,
 } from './routerEngine.ts';
 import {
+  DEFAULT_ENSEMBLE_CONFIG,
   DEFAULT_ROUTER_CONFIG,
   DEFAULT_SYSTEM_INSTRUCTIONS,
   SEED_EVAL_CASES,
+  SEED_PROJECT_MILESTONES,
   SEED_RAG_CONNECTORS,
   SEED_ROUTES,
 } from './seedData.ts';
 import type { TelemetryCollector } from './telemetry.ts';
-import {
-  DEFAULT_LIBRARY_KNOWLEDGE,
-} from './architectureBlueprints.ts';
+import { DEFAULT_LIBRARY_KNOWLEDGE } from './architectureBlueprints.ts';
 import type {
+  AgentStateSnapshot,
+  EmbeddingSlotConfig,
+  EmbeddingSlotRole,
   EncoderModelId,
+  EnsembleConfig,
+  EnsembleFusionMode,
+  EnsembleSlotRuntimeStatus,
   EvalCase,
   EvalReport,
   ExtractedFunctionCall,
@@ -41,6 +53,9 @@ import type {
   FunctionSchema,
   LibraryKnowledgeState,
   McpStdioLogEntry,
+  MilestoneProgress,
+  ProjectMilestone,
+  ProjectProgressState,
   ProviderExecutionResult,
   RagChunk,
   RagConnector,
@@ -49,8 +64,10 @@ import type {
   RouteDecisionResult,
   RouteDefinition,
   RouteInstructionOverride,
+  RouteScoreBreakdown,
   RouterConfig,
   SystemInstructionsConfig,
+  TelemetryEdgeId,
 } from './types.ts';
 
 interface PersistedState {
@@ -60,6 +77,8 @@ interface PersistedState {
   instructions: SystemInstructionsConfig;
   ragConnectors: RagConnector[];
   ragChunks: RagChunk[];
+  progressState?: ProjectProgressState;
+  agentState?: AgentStateSnapshot;
 }
 
 type FeatureExtractor = (
@@ -75,7 +94,210 @@ function migrateLegacyTargetModel(target: string): string {
 
 function migrateLegacyEncoder(enc: string | undefined): EncoderModelId {
   if (enc === 'local-subword-bm25') return 'local-subword-bm25';
+  if (enc === 'bge-m3') return 'bge-m3';
   return 'e5-small-v2';
+}
+
+function normalizeEnsembleConfig(raw?: Partial<EnsembleConfig>): EnsembleConfig {
+  const defaults = structuredClone(DEFAULT_ENSEMBLE_CONFIG);
+  const rawSlots = raw?.slots as EmbeddingSlotConfig[] | undefined;
+  if (!raw || !Array.isArray(rawSlots) || rawSlots.length === 0) {
+    return defaults;
+  }
+
+  const byRole = new Map<EmbeddingSlotRole, EmbeddingSlotConfig>();
+  for (const s of rawSlots) {
+    if (s.role === 'intent' || s.role === 'domain' || s.role === 'state') {
+      byRole.set(s.role, {
+        role: s.role,
+        modelId: migrateLegacyEncoder(s.modelId),
+        weight:
+          typeof s.weight === 'number' && Number.isFinite(s.weight)
+            ? Math.max(0, Math.min(1, s.weight))
+            : 0.33,
+        enabled: s.enabled !== false,
+      });
+    }
+  }
+
+  const mergedSlots: [EmbeddingSlotConfig, EmbeddingSlotConfig, EmbeddingSlotConfig] = [
+    byRole.get('intent') ?? defaults.slots[0],
+    byRole.get('domain') ?? defaults.slots[1],
+    byRole.get('state') ?? defaults.slots[2],
+  ];
+
+  const fusionMode: EnsembleFusionMode =
+    raw.fusionMode === 'max' || raw.fusionMode === 'cascade' ? raw.fusionMode : 'weighted_sum';
+
+  return {
+    slots: mergedSlots,
+    fusionMode,
+    parallelLoad: raw.parallelLoad !== false,
+  };
+}
+
+export class EnsembleModelManager {
+  private readonly caches = new Map<EncoderModelId, Map<string, number[]>>([
+    ['e5-small-v2', new Map()],
+    ['local-subword-bm25', new Map()],
+    ['bge-m3', new Map()],
+  ]);
+  private readonly statusMap = new Map<EmbeddingSlotRole, 'idle' | 'loading' | 'ready' | 'error'>([
+    ['intent', 'idle'],
+    ['domain', 'ready'],
+    ['state', 'ready'],
+  ]);
+  private readonly latencyMap = new Map<EmbeddingSlotRole, number | null>([
+    ['intent', null],
+    ['domain', null],
+    ['state', null],
+  ]);
+  private readonly backendMap = new Map<EncoderModelId, 'onnx' | 'local-fallback'>([
+    ['e5-small-v2', 'local-fallback'],
+    ['local-subword-bm25', 'local-fallback'],
+    ['bge-m3', 'local-fallback'],
+  ]);
+
+  constructor(
+    private readonly getE5ExtractorFn: () => Promise<FeatureExtractor>,
+    private readonly onNotify?: () => void
+  ) {}
+
+  getDimensions(modelId: EncoderModelId): number {
+    if (modelId === 'e5-small-v2') return 384;
+    if (modelId === 'bge-m3') return 1024;
+    return 256;
+  }
+
+  getStatus(role: EmbeddingSlotRole): 'idle' | 'loading' | 'ready' | 'error' {
+    return this.statusMap.get(role) ?? 'idle';
+  }
+
+  setStatus(role: EmbeddingSlotRole, status: 'idle' | 'loading' | 'ready' | 'error'): void {
+    this.statusMap.set(role, status);
+    this.onNotify?.();
+  }
+
+  clearCaches(): void {
+    for (const c of this.caches.values()) {
+      c.clear();
+    }
+  }
+
+  async loadSlot(slot: EmbeddingSlotConfig): Promise<void> {
+    if (!slot.enabled) {
+      this.statusMap.set(slot.role, 'idle');
+      return;
+    }
+    if (slot.modelId === 'local-subword-bm25') {
+      this.backendMap.set('local-subword-bm25', 'local-fallback');
+      this.statusMap.set(slot.role, 'ready');
+      return;
+    }
+    if (slot.modelId === 'bge-m3') {
+      // Deterministic 1024-dim semantic projection is ready immediately; remote ONNX is optional
+      this.backendMap.set('bge-m3', 'local-fallback');
+      this.statusMap.set(slot.role, 'ready');
+      return;
+    }
+    // e5-small-v2
+    this.statusMap.set(slot.role, 'loading');
+    try {
+      await this.getE5ExtractorFn();
+      this.backendMap.set('e5-small-v2', 'onnx');
+      this.statusMap.set(slot.role, 'ready');
+    } catch {
+      this.backendMap.set('e5-small-v2', 'local-fallback');
+      this.statusMap.set(slot.role, 'ready');
+    }
+  }
+
+  async loadAll(slots: EmbeddingSlotConfig[], parallel = true): Promise<void> {
+    if (parallel) {
+      await Promise.all(slots.map((s) => this.loadSlot(s)));
+    } else {
+      for (const s of slots) {
+        await this.loadSlot(s);
+      }
+    }
+    this.onNotify?.();
+  }
+
+  async embedTexts(
+    modelId: EncoderModelId,
+    texts: string[],
+    role?: EmbeddingSlotRole
+  ): Promise<number[][]> {
+    const startNs = process.hrtime.bigint();
+    const cache = this.caches.get(modelId) ?? new Map<string, number[]>();
+    this.caches.set(modelId, cache);
+    const dims = this.getDimensions(modelId);
+
+    const formattedList = texts.map((t) =>
+      modelId === 'bge-m3' ? `Represent this sentence: ${t}` : t
+    );
+    const missing = Array.from(new Set(formattedList)).filter((k) => k.length > 0 && !cache.has(k));
+
+    if (missing.length > 0) {
+      if (modelId === 'e5-small-v2') {
+        try {
+          const ext = await this.getE5ExtractorFn();
+          for (let i = 0; i < missing.length; i += 24) {
+            const batch = missing.slice(i, i + 24);
+            const out = await ext(batch, { pooling: 'mean', normalize: true });
+            const vecs = out.tolist();
+            batch.forEach((key, idx) => {
+              cache.set(key, vecs[idx]);
+            });
+          }
+          this.backendMap.set('e5-small-v2', 'onnx');
+        } catch {
+          this.backendMap.set('e5-small-v2', 'local-fallback');
+          for (const key of missing) {
+            cache.set(key, computeLocalDenseVector(key, dims));
+          }
+        }
+      } else {
+        this.backendMap.set(modelId, 'local-fallback');
+        for (const key of missing) {
+          const cleanForLocal =
+            modelId === 'bge-m3' ? key.replace(/^Represent this sentence:\s*/, '') : key;
+          cache.set(key, computeLocalDenseVector(cleanForLocal, dims));
+        }
+      }
+    }
+
+    const elapsedMs =
+      Math.round((Number(process.hrtime.bigint() - startNs) / 1_000_000) * 100) / 100;
+    if (role) {
+      this.statusMap.set(role, 'ready');
+      this.latencyMap.set(role, elapsedMs);
+    }
+
+    return formattedList.map((key) => {
+      const cached = cache.get(key);
+      if (cached) return cached;
+      const cleanForLocal =
+        modelId === 'bge-m3' ? key.replace(/^Represent this sentence:\s*/, '') : key;
+      return computeLocalDenseVector(cleanForLocal, dims);
+    });
+  }
+
+  getCachedVector(modelId: EncoderModelId, key: string): number[] | undefined {
+    return this.caches.get(modelId)?.get(key);
+  }
+
+  getSlotStatuses(ensemble: EnsembleConfig): EnsembleSlotRuntimeStatus[] {
+    return ensemble.slots.map((slot) => ({
+      role: slot.role,
+      modelId: slot.modelId,
+      status: slot.enabled ? this.getStatus(slot.role) : 'idle',
+      dimensions: this.getDimensions(slot.modelId),
+      cachedCount: this.caches.get(slot.modelId)?.size ?? 0,
+      lastLatencyMs: this.latencyMap.get(slot.role) ?? null,
+      backend: this.backendMap.get(slot.modelId) ?? 'local-fallback',
+    }));
+  }
 }
 
 export class UnifiedRouterService {
@@ -88,6 +310,10 @@ export class UnifiedRouterService {
   private readonly e5EmbeddingCache = new Map<string, number[]>();
   private e5PipelinePromise: Promise<FeatureExtractor> | null = null;
   private e5Status: 'idle' | 'loading' | 'ready' | 'error' = 'idle';
+
+  private readonly agentState: AgentStateStore;
+  private readonly ensembleManager: EnsembleModelManager;
+  private readonly progressTracker: ProjectProgressTracker;
 
   private isEvaluatingOrFitting = false;
   private lastOpenAiError: string | null = null;
@@ -109,7 +335,37 @@ export class UnifiedRouterService {
     this.dataDir = path.join(rootDir, 'data');
     this.stateFile = path.join(this.dataDir, 'router-state.json');
     this.knowledgeFile = path.join(this.dataDir, 'library-knowledge.json');
+
+    this.agentState = new AgentStateStore();
+    this.ensembleManager = new EnsembleModelManager(
+      () => this.getE5Extractor(),
+      () => this.telemetry.notify()
+    );
+
     this.state = this.loadState();
+
+    const stateSlotModel = (): EncoderModelId =>
+      this.getEffectiveEnsembleConfig().slots.find((s) => s.role === 'state')?.modelId ?? 'bge-m3';
+
+    this.progressTracker = new ProjectProgressTracker({
+      sessionId: `sr-session-${Date.now().toString(36)}`,
+      agentState: this.agentState,
+      embedStateTexts: (texts) => this.ensembleManager.embedTexts(stateSlotModel(), texts, 'state'),
+    });
+
+    if (this.state.agentState) {
+      this.agentState.loadSnapshot(this.state.agentState);
+    }
+    if (this.state.progressState && this.state.progressState.milestones.length > 0) {
+      this.progressTracker.restoreState(this.state.progressState);
+    } else {
+      // Seed synchronous milestone shells first, then embed async in warmUp/first eval
+      void this.progressTracker.setMilestones(structuredClone(SEED_PROJECT_MILESTONES)).then((ps) => {
+        this.state.progressState = ps;
+        this.saveState();
+      });
+    }
+
     this.saveState();
     this.libraryKnowledge = this.loadLibraryKnowledge();
     this.saveLibraryKnowledge();
@@ -129,6 +385,7 @@ export class UnifiedRouterService {
             ...DEFAULT_ROUTER_CONFIG,
             ...parsed.config,
             encoderModel: migrateLegacyEncoder(parsed.config.encoderModel),
+            encoderEnsemble: normalizeEnsembleConfig(parsed.config.encoderEnsemble),
             mcpEnabled: parsed.config.mcpEnabled ?? DEFAULT_ROUTER_CONFIG.mcpEnabled,
             ragEnabledByDefault:
               parsed.config.ragEnabledByDefault ?? DEFAULT_ROUTER_CONFIG.ragEnabledByDefault,
@@ -155,6 +412,8 @@ export class UnifiedRouterService {
             instructions,
             ragConnectors,
             ragChunks,
+            progressState: parsed.progressState,
+            agentState: parsed.agentState,
           };
         }
       }
@@ -165,7 +424,7 @@ export class UnifiedRouterService {
     return {
       routes: structuredClone(SEED_ROUTES),
       evalCases: structuredClone(SEED_EVAL_CASES),
-      config: { ...DEFAULT_ROUTER_CONFIG },
+      config: structuredClone(DEFAULT_ROUTER_CONFIG),
       instructions: structuredClone(DEFAULT_SYSTEM_INSTRUCTIONS),
       ragConnectors: structuredClone(SEED_RAG_CONNECTORS),
       ragChunks: [],
@@ -196,12 +455,23 @@ export class UnifiedRouterService {
         this.state = this.loadState();
         this.stateFileMtimeMs = mtimeMs;
         this.e5EmbeddingCache.clear();
+        this.ensembleManager.clearCaches();
+        if (this.state.progressState) {
+          this.progressTracker.restoreState(this.state.progressState);
+        }
+        if (this.state.agentState) {
+          this.agentState.loadSnapshot(this.state.agentState);
+        }
         return true;
       }
     } catch {
       // Ignore stat/read race gracefully
     }
     return false;
+  }
+
+  getEffectiveEnsembleConfig(): EnsembleConfig {
+    return normalizeEnsembleConfig(this.state.config.encoderEnsemble);
   }
 
   private loadLibraryKnowledge(): LibraryKnowledgeState {
@@ -277,6 +547,11 @@ export class UnifiedRouterService {
   getTelemetryStateInput(expressPort: number) {
     const activeProfile = this.chatgptAuth.getActiveProfile();
     const loopback = this.chatgptAuth.getLoopbackRuntimeStatus();
+    const ensemble = this.getEffectiveEnsembleConfig();
+    const progress = this.progressTracker.getState();
+    const activeFocusLabel =
+      progress.milestones.find((m) => m.id === progress.currentFocusId)?.label ?? null;
+
     return {
       expressPort,
       chatGptConnected: Boolean(activeProfile?.connected),
@@ -302,6 +577,11 @@ export class UnifiedRouterService {
       ragChunkCount: this.state.ragChunks.length,
       lastRagLatencyMs: this.lastRagLatencyMs,
       lastRagError: this.lastRagError,
+      ensembleActive: ensemble.slots.some((s) => s.enabled),
+      fusionMode: ensemble.fusionMode,
+      slotStatuses: this.ensembleManager.getSlotStatuses(ensemble),
+      progressOverall: progress.overallProgress,
+      activeFocusLabel,
     };
   }
 
@@ -314,6 +594,8 @@ export class UnifiedRouterService {
       instructions: this.state.instructions,
       ragConnectors: this.state.ragConnectors,
       ragChunksCount: this.state.ragChunks.length,
+      progressState: this.progressTracker.getState(),
+      agentState: this.agentState.getSnapshot(),
     };
   }
 
@@ -344,12 +626,74 @@ export class UnifiedRouterService {
   }
 
   getProvidersMetadata() {
+    const ensemble = this.getEffectiveEnsembleConfig();
     return {
       activeEncoder: this.state.config.encoderModel,
       e5Status: this.e5Status,
       e5CachedCount: this.e5EmbeddingCache.size,
       encoders: ENCODER_PROVIDERS,
+      ensemble,
+      slotStatuses: this.ensembleManager.getSlotStatuses(ensemble),
     };
+  }
+
+  getProgressState(): ProjectProgressState {
+    this.reloadStateIfModified();
+    return this.progressTracker.getState();
+  }
+
+  getAgentStateSnapshot(): AgentStateSnapshot {
+    this.reloadStateIfModified();
+    return this.agentState.getSnapshot();
+  }
+
+  clearAgentRouteOverride(): AgentStateSnapshot {
+    this.agentState.set('routeOverride', null);
+    this.state.agentState = this.agentState.getSnapshot();
+    this.saveState();
+    this.telemetry.notify();
+    return this.state.agentState;
+  }
+
+  async setMilestones(milestones: ProjectMilestone[]): Promise<ProjectProgressState> {
+    const endTrack = this.telemetry.beginSpan('embedding_state->progress_tracker');
+    try {
+      const next = await this.progressTracker.setMilestones(milestones);
+      this.state.progressState = next;
+      this.state.agentState = this.agentState.getSnapshot();
+      this.saveState();
+      endTrack('ok');
+      return next;
+    } catch (err) {
+      endTrack('error');
+      throw err;
+    }
+  }
+
+  async evaluateProgressOutput(outputText: string): Promise<{
+    state: ProjectProgressState;
+    newlyCompleted: MilestoneProgress[];
+    autoAdvanceRoute: string | null;
+    agentState: AgentStateSnapshot;
+  }> {
+    const endStateEdge = this.telemetry.beginSpan('router->embedding_state');
+    const endTrack = this.telemetry.beginSpan('embedding_state->progress_tracker');
+    try {
+      const res = await this.progressTracker.updateProgress(outputText);
+      this.state.progressState = res.state;
+      this.state.agentState = this.agentState.getSnapshot();
+      this.saveState();
+      endStateEdge('ok');
+      endTrack('ok');
+      return {
+        ...res,
+        agentState: this.state.agentState,
+      };
+    } catch (err) {
+      endStateEdge('error');
+      endTrack('error');
+      throw err;
+    }
   }
 
   recordMcpLog(entry: McpStdioLogEntry): void {
@@ -431,6 +775,11 @@ export class UnifiedRouterService {
   }
 
   async warmUpEmbeddings(): Promise<void> {
+    const ensemble = this.getEffectiveEnsembleConfig();
+    if (ensemble.slots.some((s) => s.enabled)) {
+      await this.ensembleManager.loadAll(ensemble.slots, ensemble.parallelLoad);
+      await this.progressTracker.ensureMilestonesEmbedded();
+    }
     if (this.state.config.encoderModel !== 'e5-small-v2') return;
     const endBridge = this.telemetry.beginSpan('router->bridge');
     try {
@@ -550,10 +899,12 @@ export class UnifiedRouterService {
       }
     }
 
-    const baseLocal = createLocalVectorLookup();
+    const dims = this.ensembleManager.getDimensions(encoderModel);
+    const baseLocal = createLocalVectorLookup(dims);
     const endLocalEmbed = this.telemetry.beginSpan('bridge->embedding');
     const wrappedLocal: VectorLookup = {
-      getVector: (text: string) => baseLocal.getVector(formatEmbeddingText(text, 'query', embInstr)),
+      getVector: (text: string) =>
+        baseLocal.getVector(formatEmbeddingText(text, 'query', embInstr)),
       getQueryVector: (text: string) =>
         baseLocal.getVector(formatEmbeddingText(text, 'query', embInstr)),
       getPassageVector: (text: string) =>
@@ -565,8 +916,97 @@ export class UnifiedRouterService {
     endBridge('ok');
     return {
       lookup: wrappedLocal,
-      encoderUsed: 'Local Subword + BM25 Hybrid',
+      encoderUsed:
+        encoderModel === 'bge-m3'
+          ? 'BAAI/bge-m3 (1024d Projection)'
+          : 'Local Subword + BM25 Hybrid',
     };
+  }
+
+  private async buildSlotVectorLookup(
+    slot: EmbeddingSlotConfig,
+    queryTexts: string[],
+    routes: RouteDefinition[],
+    includeRagChunks: boolean
+  ): Promise<EnsembleSlotLookup> {
+    const roleEdgeMap: Record<EmbeddingSlotRole, TelemetryEdgeId> = {
+      intent: 'router->embedding_intent',
+      domain: 'router->embedding_domain',
+      state: 'router->embedding_state',
+    };
+    const edgeId = roleEdgeMap[slot.role];
+    const endSlotSpan = this.telemetry.beginSpan(edgeId);
+
+    try {
+      const embInstr = this.state.instructions.embedding;
+      const { passageOverrideMap, items } = this.collectPassageDescriptors(routes, includeRagChunks);
+      const formattedQueries = queryTexts.map((q) => formatEmbeddingText(q, 'query', embInstr));
+      const formattedPassages = items.map((i) => i.formatted);
+      const uniqueTexts = Array.from(new Set([...formattedQueries, ...formattedPassages])).filter(
+        Boolean
+      );
+
+      await this.ensembleManager.embedTexts(slot.modelId, uniqueTexts, slot.role);
+      const dims = this.ensembleManager.getDimensions(slot.modelId);
+      const fallback = createLocalVectorLookup(dims);
+
+      const cacheKeyFor = (raw: string) =>
+        slot.modelId === 'bge-m3' ? `Represent this sentence: ${raw}` : raw;
+
+      const lookup: VectorLookup = {
+        getVector: (text: string) => {
+          const qText = formatEmbeddingText(text, 'query', embInstr);
+          const pText = formatEmbeddingText(
+            text,
+            'passage',
+            embInstr,
+            passageOverrideMap.get(text)
+          );
+          return (
+            this.ensembleManager.getCachedVector(slot.modelId, cacheKeyFor(qText)) ??
+            this.ensembleManager.getCachedVector(slot.modelId, cacheKeyFor(pText)) ??
+            fallback.getVector(qText)
+          );
+        },
+        getQueryVector: (text: string) => {
+          const qText = formatEmbeddingText(text, 'query', embInstr);
+          return (
+            this.ensembleManager.getCachedVector(slot.modelId, cacheKeyFor(qText)) ??
+            fallback.getVector(qText)
+          );
+        },
+        getPassageVector: (text: string) => {
+          const pText = formatEmbeddingText(
+            text,
+            'passage',
+            embInstr,
+            passageOverrideMap.get(text)
+          );
+          return (
+            this.ensembleManager.getCachedVector(slot.modelId, cacheKeyFor(pText)) ??
+            fallback.getVector(pText)
+          );
+        },
+      };
+
+      const dur = endSlotSpan('ok');
+      const fusionEdgeMap: Record<EmbeddingSlotRole, TelemetryEdgeId> = {
+        intent: 'embedding_intent->ensemble',
+        domain: 'embedding_domain->ensemble',
+        state: 'embedding_state->ensemble',
+      };
+      this.telemetry.recordPulse(fusionEdgeMap[slot.role], dur, 'ok');
+
+      return {
+        role: slot.role,
+        lookup,
+        weight: slot.weight,
+        enabled: slot.enabled,
+      };
+    } catch (err) {
+      endSlotSpan('error');
+      throw err;
+    }
   }
 
   async embedTest(text: string, encoderModel?: EncoderModelId) {
@@ -844,17 +1284,56 @@ export class UnifiedRouterService {
       const useRag =
         opts.useRag !== undefined ? opts.useRag : activeConfig.ragEnabledByDefault;
 
-      const { lookup, encoderUsed } =
-        activeConfig.mode === 'sparse'
-          ? { lookup: createLocalVectorLookup(), encoderUsed: 'Sparse BM25 / Lexical' }
-          : await this.buildVectorLookup(
-              [query],
-              this.state.routes,
-              activeConfig.encoderModel,
-              useRag
-            );
+      const ensembleCfg = this.getEffectiveEnsembleConfig();
+      const enabledEnsembleSlots = ensembleCfg.slots.filter((s) => s.enabled);
+      const useEnsemble = activeConfig.mode !== 'sparse' && enabledEnsembleSlots.length > 0 && !opts.encoderModel;
 
-      const scored = scoreRoutes(query, this.state.routes, activeConfig, lookup);
+      let lookup: VectorLookup;
+      let encoderUsed: string;
+      let scored: {
+        matchedRoute: RouteDefinition | null;
+        topScore: number;
+        allScores: RouteScoreBreakdown[];
+        perEncoderBreakdown?: Partial<Record<EmbeddingSlotRole, RouteScoreBreakdown[]>>;
+      };
+
+      if (useEnsemble) {
+        const endEnsemble = this.telemetry.beginSpan('ensemble->router');
+        const slotLookups = await Promise.all(
+          enabledEnsembleSlots.map((slot) =>
+            this.buildSlotVectorLookup(slot, [query], this.state.routes, useRag)
+          )
+        );
+        const runner = new EmbeddingEnsembleRunner({
+          slots: slotLookups.map((sl) => ({
+            ...sl,
+            modelId: enabledEnsembleSlots.find((c) => c.role === sl.role)?.modelId ?? 'e5-small-v2',
+          })),
+          fusionMode: ensembleCfg.fusionMode,
+        });
+        scored = scoreRoutesEnsemble(query, this.state.routes, activeConfig, runner.toVectorLookup());
+        endEnsemble('ok');
+        // Primary lookup for RAG chunk scoring (prefer domain -> intent -> first enabled)
+        lookup =
+          slotLookups.find((s) => s.role === 'domain')?.lookup ??
+          slotLookups[0].lookup;
+        encoderUsed = `3-Slot Ensemble (${ensembleCfg.fusionMode}: ${enabledEnsembleSlots
+          .map((s) => `${s.role}=${s.modelId}`)
+          .join(', ')})`;
+      } else {
+        const single =
+          activeConfig.mode === 'sparse'
+            ? { lookup: createLocalVectorLookup(), encoderUsed: 'Sparse BM25 / Lexical' }
+            : await this.buildVectorLookup(
+                [query],
+                this.state.routes,
+                activeConfig.encoderModel,
+                useRag
+              );
+        lookup = single.lookup;
+        encoderUsed = single.encoderUsed;
+        scored = scoreRoutes(query, this.state.routes, activeConfig, lookup);
+      }
 
       let ragMatches: RagRetrievalMatch[] = [];
       if (useRag && this.state.ragChunks.length > 0) {
@@ -904,6 +1383,21 @@ export class UnifiedRouterService {
         systemPromptUsed = execOut.systemPromptUsed;
       }
 
+      // Update EM-3 Project Progress Tracker after turn execution
+      const progressText =
+        typeof providerExecution?.output === 'string'
+          ? `${query} ${providerExecution.output}`
+          : providerExecution?.output && typeof providerExecution.output === 'object'
+            ? `${query} ${JSON.stringify(providerExecution.output)}`
+            : query;
+      let progressAutoAdvanceRoute: string | null = null;
+      try {
+        const progRes = await this.evaluateProgressOutput(progressText);
+        progressAutoAdvanceRoute = progRes.autoAdvanceRoute;
+      } catch {
+        // Non-blocking if milestone evaluation fails
+      }
+
       const elapsedMs =
         Math.round((Number(process.hrtime.bigint() - startNs) / 1_000_000) * 100) / 100;
       this.lastRouteLatencyMs = elapsedMs;
@@ -938,6 +1432,9 @@ export class UnifiedRouterService {
           chatgptSystemPrompt: systemPromptUsed,
         },
         allScores: scored.allScores,
+        perEncoderBreakdown: scored.perEncoderBreakdown,
+        ensembleFusionMode: useEnsemble ? ensembleCfg.fusionMode : undefined,
+        progressAutoAdvanceRoute,
       };
     } catch (err) {
       this.lastRouterError = (err as Error).message;
@@ -1142,6 +1639,9 @@ export class UnifiedRouterService {
       body.encoderModel ?? this.state.config.encoderModel
     );
     const providerMeta = ENCODER_PROVIDERS.find((p) => p.id === nextEncoder);
+    const nextEnsemble = body.encoderEnsemble
+      ? normalizeEnsembleConfig(body.encoderEnsemble)
+      : this.getEffectiveEnsembleConfig();
 
     this.state.config = {
       mode: body.mode ?? this.state.config.mode,
@@ -1157,6 +1657,7 @@ export class UnifiedRouterService {
             ? providerMeta.recommendedThreshold
             : this.state.config.defaultThreshold,
       encoderModel: nextEncoder,
+      encoderEnsemble: nextEnsemble,
       mcpEnabled:
         typeof body.mcpEnabled === 'boolean'
           ? body.mcpEnabled
@@ -1174,9 +1675,17 @@ export class UnifiedRouterService {
       }));
     }
 
+    if (body.encoderEnsemble) {
+      void this.ensembleManager.loadAll(nextEnsemble.slots, nextEnsemble.parallelLoad);
+    }
+
     this.saveState();
     this.telemetry.notify();
-    return { config: this.state.config, routes: this.state.routes };
+    return {
+      config: this.state.config,
+      routes: this.state.routes,
+      slotStatuses: this.ensembleManager.getSlotStatuses(nextEnsemble),
+    };
   }
 
   updateInstructions(patch: {
@@ -1394,15 +1903,21 @@ export class UnifiedRouterService {
   }
 
   resetWorkspace() {
+    this.agentState.reset();
     this.state = {
       routes: structuredClone(SEED_ROUTES),
       evalCases: structuredClone(SEED_EVAL_CASES),
-      config: { ...DEFAULT_ROUTER_CONFIG },
+      config: structuredClone(DEFAULT_ROUTER_CONFIG),
       instructions: structuredClone(DEFAULT_SYSTEM_INSTRUCTIONS),
       ragConnectors: structuredClone(SEED_RAG_CONNECTORS),
       ragChunks: [],
     };
     this.e5EmbeddingCache.clear();
+    this.ensembleManager.clearCaches();
+    void this.progressTracker.setMilestones(structuredClone(SEED_PROJECT_MILESTONES)).then((ps) => {
+      this.state.progressState = ps;
+      this.saveState();
+    });
     this.saveState();
     this.telemetry.notify();
     return this.getWorkspaceData();

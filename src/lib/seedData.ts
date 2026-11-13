@@ -1,10 +1,71 @@
 import type {
+  EnsembleConfig,
   EvalCase,
+  ProjectMilestone,
   RagConnector,
   RouteDefinition,
   RouterConfig,
   SystemInstructionsConfig,
 } from './types.ts';
+
+export const DEFAULT_ENSEMBLE_CONFIG: EnsembleConfig = {
+  slots: [
+    {
+      modelId: 'e5-small-v2',
+      role: 'intent',
+      weight: 0.4,
+      enabled: true,
+    },
+    {
+      modelId: 'local-subword-bm25',
+      role: 'domain',
+      weight: 0.4,
+      enabled: true,
+    },
+    {
+      modelId: 'bge-m3',
+      role: 'state',
+      weight: 0.2,
+      enabled: true,
+    },
+  ],
+  fusionMode: 'weighted_sum',
+  parallelLoad: true,
+};
+
+export const SEED_PROJECT_MILESTONES: ProjectMilestone[] = [
+  {
+    id: 'ms-intent-triage',
+    label: 'Intent Classification & Safety Gate',
+    description:
+      'Identify user intent cleanly across political guardrails, prompt injection defense, and tool dispatch without false positives.',
+    completionThreshold: 0.72,
+    targetRouteHint: 'sql_analytics',
+  },
+  {
+    id: 'ms-sql-schema',
+    label: 'PostgreSQL Analytics & Indexing Design',
+    description:
+      'Generate production PostgreSQL window function queries, composite B-Tree index plans, and retention SQL analytics.',
+    completionThreshold: 0.75,
+    targetRouteHint: 'billing_refund',
+  },
+  {
+    id: 'ms-billing-resolution',
+    label: 'Billing & Order Refund Extraction',
+    description:
+      'Extract structured order IDs (ORD-XXXX) and refund reasons for duplicate credit card charge disputes.',
+    completionThreshold: 0.78,
+    targetRouteHint: 'get_time',
+  },
+  {
+    id: 'ms-rag-grounding',
+    label: 'TRINITY / Webhook RAG Grounding',
+    description:
+      'Ground final assistant responses with retrieved external webhook or TRINITY FAISS knowledge chunks and source citations.',
+    completionThreshold: 0.8,
+  },
+];
 
 export const DEFAULT_ROUTER_CONFIG: RouterConfig = {
   mode: 'hybrid',
@@ -12,6 +73,7 @@ export const DEFAULT_ROUTER_CONFIG: RouterConfig = {
   aggregation: 'max',
   defaultThreshold: 0.62,
   encoderModel: 'e5-small-v2',
+  encoderEnsemble: structuredClone(DEFAULT_ENSEMBLE_CONFIG),
   mcpEnabled: true,
   ragEnabledByDefault: true,
 };

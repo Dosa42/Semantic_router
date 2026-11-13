@@ -1,5 +1,7 @@
 import type {
   AggregationStrategy,
+  EmbeddingSlotRole,
+  EnsembleFusionMode,
   EvalCase,
   EvalPrediction,
   EvalReport,
@@ -319,17 +321,75 @@ export interface VectorLookup {
   getPassageVector?: (text: string) => number[];
 }
 
-export function createLocalVectorLookup(): VectorLookup {
+export interface EnsembleSlotLookup {
+  role: EmbeddingSlotRole;
+  lookup: VectorLookup;
+  weight: number;
+  enabled?: boolean;
+}
+
+export interface EnsembleVectorLookup {
+  slots: EnsembleSlotLookup[];
+  fusionMode: EnsembleFusionMode;
+}
+
+export function createLocalVectorLookup(dims = 256): VectorLookup {
   const cache = new Map<string, number[]>();
   return {
     getVector(text: string) {
       const existing = cache.get(text);
       if (existing) return existing;
-      const vec = computeLocalDenseVector(text);
+      const vec = computeLocalDenseVector(text, dims);
       cache.set(text, vec);
       return vec;
     },
   };
+}
+
+export function fuseEnsembleScores(
+  perSlotScores: Array<{ role: EmbeddingSlotRole; score: number; weight: number }>,
+  mode: EnsembleFusionMode
+): number {
+  if (perSlotScores.length === 0) return 0;
+
+  if (mode === 'max') {
+    return round4(Math.max(...perSlotScores.map((s) => s.score)));
+  }
+
+  if (mode === 'cascade') {
+    const intent = perSlotScores.find((s) => s.role === 'intent');
+    if (intent && intent.score < 0.3) return 0;
+  }
+
+  // weighted_sum (and cascade pass-through after intent gate)
+  const totalWeight = perSlotScores.reduce((acc, s) => acc + Math.max(0, s.weight), 0);
+  if (totalWeight <= 0) {
+    const mean = perSlotScores.reduce((acc, s) => acc + s.score, 0) / perSlotScores.length;
+    return round4(mean);
+  }
+  const weighted = perSlotScores.reduce(
+    (acc, s) => acc + (s.score * Math.max(0, s.weight)) / totalWeight,
+    0
+  );
+  return round4(weighted);
+}
+
+export async function runParallelEmbeddings(
+  texts: string[],
+  slots: Array<{ role: EmbeddingSlotRole; lookup: VectorLookup }>
+): Promise<Record<EmbeddingSlotRole, number[][]>> {
+  const entries = await Promise.all(
+    slots.map(async ({ role, lookup }) => ({
+      role,
+      vecs: texts.map((text) =>
+        lookup.getQueryVector ? lookup.getQueryVector(text) : lookup.getVector(text)
+      ),
+    }))
+  );
+  return Object.fromEntries(entries.map((e) => [e.role, e.vecs])) as Record<
+    EmbeddingSlotRole,
+    number[][]
+  >;
 }
 
 export function scoreRoutes(
@@ -419,6 +479,95 @@ export function scoreRoutes(
     matchedRoute,
     topScore: breakdowns[0]?.score ?? 0,
     allScores: breakdowns,
+  };
+}
+
+export function scoreRoutesEnsemble(
+  query: string,
+  routes: RouteDefinition[],
+  config: RouterConfig,
+  ensemble: EnsembleVectorLookup
+): {
+  matchedRoute: RouteDefinition | null;
+  topScore: number;
+  allScores: RouteScoreBreakdown[];
+  perEncoderBreakdown: Partial<Record<EmbeddingSlotRole, RouteScoreBreakdown[]>>;
+} {
+  const activeSlots = ensemble.slots.filter((s) => s.enabled !== false);
+  const enabledRoutes = routes.filter((r) => r.enabled && r.utterances.length > 0);
+
+  if (activeSlots.length === 0) {
+    const fallback = scoreRoutes(query, routes, config, createLocalVectorLookup());
+    return {
+      ...fallback,
+      perEncoderBreakdown: {},
+    };
+  }
+
+  const perEncoderBreakdown: Partial<Record<EmbeddingSlotRole, RouteScoreBreakdown[]>> = {};
+  for (const slot of activeSlots) {
+    const slotRes = scoreRoutes(query, enabledRoutes, config, slot.lookup);
+    perEncoderBreakdown[slot.role] = slotRes.allScores;
+  }
+
+  // Sort active slots by weight descending so the highest-weight slot supplies representative metadata
+  const sortedSlots = [...activeSlots].sort((a, b) => b.weight - a.weight);
+
+  const fusedBreakdowns: RouteScoreBreakdown[] = enabledRoutes.map((route) => {
+    const perEncoderScores: Partial<Record<EmbeddingSlotRole, number>> = {};
+    const slotInputs: Array<{ role: EmbeddingSlotRole; score: number; weight: number }> = [];
+    const denseInputs: Array<{ role: EmbeddingSlotRole; score: number; weight: number }> = [];
+    const sparseInputs: Array<{ role: EmbeddingSlotRole; score: number; weight: number }> = [];
+
+    let primarySlotBreakdown: RouteScoreBreakdown | undefined;
+
+    for (const slot of sortedSlots) {
+      const list = perEncoderBreakdown[slot.role] ?? [];
+      const found = list.find((b) => b.routeId === route.id);
+      if (!found) continue;
+      if (!primarySlotBreakdown) primarySlotBreakdown = found;
+      perEncoderScores[slot.role] = found.score;
+      slotInputs.push({ role: slot.role, score: found.score, weight: slot.weight });
+      denseInputs.push({ role: slot.role, score: found.denseScore, weight: slot.weight });
+      sparseInputs.push({ role: slot.role, score: found.sparseScore, weight: slot.weight });
+    }
+
+    const ensembleFusedScore = fuseEnsembleScores(slotInputs, ensemble.fusionMode);
+    const fusedDense = fuseEnsembleScores(denseInputs, ensemble.fusionMode);
+    const fusedSparse = fuseEnsembleScores(sparseInputs, ensemble.fusionMode);
+    const threshold = route.scoreThreshold ?? config.defaultThreshold;
+    const passed = ensembleFusedScore >= threshold;
+    const margin = round4(ensembleFusedScore - threshold);
+
+    return {
+      routeId: route.id,
+      routeName: route.name,
+      routeType: route.routeType,
+      targetModel: route.targetModel,
+      score: ensembleFusedScore,
+      denseScore: fusedDense,
+      sparseScore: fusedSparse,
+      threshold,
+      passed,
+      margin,
+      topUtterance: primarySlotBreakdown?.topUtterance ?? route.utterances[0] ?? '',
+      utteranceMatches: primarySlotBreakdown?.utteranceMatches ?? [],
+      perEncoderScores,
+      ensembleFusedScore,
+    };
+  });
+
+  fusedBreakdowns.sort((a, b) => b.score - a.score);
+  const winnerBreakdown = fusedBreakdowns.find((b) => b.passed) ?? null;
+  const matchedRoute = winnerBreakdown
+    ? enabledRoutes.find((r) => r.id === winnerBreakdown.routeId) ?? null
+    : null;
+
+  return {
+    matchedRoute,
+    topScore: fusedBreakdowns[0]?.score ?? 0,
+    allScores: fusedBreakdowns,
+    perEncoderBreakdown,
   };
 }
 

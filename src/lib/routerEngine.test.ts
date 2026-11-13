@@ -15,9 +15,15 @@ import {
   createLocalVectorLookup,
   evaluateDataset,
   extractDynamicParametersLocal,
+  fuseEnsembleScores,
   optimizeRouteThresholds,
+  runParallelEmbeddings,
   scoreRoutes,
+  scoreRoutesEnsemble,
 } from './routerEngine';
+import { createDefaultLocalEnsembleRunner } from './embeddingEnsemble';
+import { AgentStateStore } from './agentState';
+import { ProjectProgressTracker } from './progressTracker';
 import {
   ENCODER_PROVIDERS,
   ROUTE_PROVIDER_FUNCTIONS,
@@ -761,5 +767,162 @@ test('TRINITY :7700 works both as External Webhook Connector and MCP tools + rel
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('fuseEnsembleScores, runParallelEmbeddings, and scoreRoutesEnsemble handle heterogeneous 3-slot encoders', async () => {
+  assert.equal(
+    fuseEnsembleScores(
+      [
+        { role: 'intent', score: 0.8, weight: 0.5 },
+        { role: 'domain', score: 0.6, weight: 0.5 },
+      ],
+      'weighted_sum'
+    ),
+    0.7
+  );
+  assert.equal(
+    fuseEnsembleScores(
+      [
+        { role: 'intent', score: 0.8, weight: 0.2 },
+        { role: 'domain', score: 0.91, weight: 0.8 },
+      ],
+      'max'
+    ),
+    0.91
+  );
+  // Cascade gates at intent < 0.30
+  assert.equal(
+    fuseEnsembleScores(
+      [
+        { role: 'intent', score: 0.25, weight: 0.4 },
+        { role: 'domain', score: 0.95, weight: 0.6 },
+      ],
+      'cascade'
+    ),
+    0
+  );
+
+  // Providers registry includes bge-m3 and defaultRole on all 3 encoders
+  assert.equal(ENCODER_PROVIDERS.length, 3);
+  assert.equal(ENCODER_PROVIDERS.find((e) => e.id === 'e5-small-v2')?.defaultRole, 'intent');
+  assert.equal(ENCODER_PROVIDERS.find((e) => e.id === 'local-subword-bm25')?.defaultRole, 'domain');
+  assert.equal(ENCODER_PROVIDERS.find((e) => e.id === 'bge-m3')?.defaultRole, 'state');
+
+  const runner = createDefaultLocalEnsembleRunner();
+  const vecs = await runParallelEmbeddings(
+    ['Write a PostgreSQL window function query'],
+    runner.getActiveSlots().map((s) => ({ role: s.role, lookup: s.lookup }))
+  );
+  assert.equal(vecs.intent[0].length, 384);
+  assert.equal(vecs.domain[0].length, 256);
+  assert.equal(vecs.state[0].length, 1024);
+
+  const calibratedRoutes = SEED_ROUTES.map((r) => ({ ...r, scoreThreshold: 0.28 }));
+  const res = scoreRoutesEnsemble(
+    'Write a SQL query to find top customers in PostgreSQL',
+    calibratedRoutes,
+    LOCAL_TEST_CONFIG,
+    runner.toVectorLookup()
+  );
+  assert.equal(res.matchedRoute?.name, 'sql_analytics');
+  assert.ok(res.allScores[0].perEncoderScores?.intent !== undefined);
+  assert.ok(res.allScores[0].perEncoderScores?.domain !== undefined);
+  assert.ok(res.allScores[0].perEncoderScores?.state !== undefined);
+  assert.ok(res.allScores[0].ensembleFusedScore !== undefined);
+  assert.ok((res.perEncoderBreakdown.state?.length ?? 0) > 0);
+});
+
+test('AgentStateStore and ProjectProgressTracker score milestones in EM-3 space and trigger routeOverride', async () => {
+  const agentState = new AgentStateStore();
+  let overrideNotifications = 0;
+  const unsub = agentState.subscribe('routeOverride', (val) => {
+    if (val) overrideNotifications += 1;
+  });
+
+  const em3Lookup = createLocalVectorLookup(1024);
+  const tracker = new ProjectProgressTracker({
+    sessionId: 'test-session',
+    agentState,
+    embedStateTexts: async (texts) => texts.map((t) => em3Lookup.getVector(t)),
+  });
+
+  await tracker.setMilestones([
+    {
+      id: 'ms-1',
+      label: 'SQL Analytics Query',
+      description: 'Generate production PostgreSQL window function queries and composite B-Tree index plans.',
+      completionThreshold: 0.7,
+      targetRouteHint: 'billing_refund',
+    },
+    {
+      id: 'ms-2',
+      label: 'Billing Dispute Ticket',
+      description: 'Process billing refund order ORD-4821 duplicate credit card charge.',
+      completionThreshold: 0.7,
+    },
+  ]);
+
+  const evalRes = await tracker.updateProgress(
+    'Generate production PostgreSQL window function queries and composite B-Tree index plans.'
+  );
+  assert.equal(evalRes.newlyCompleted.length, 1);
+  assert.equal(evalRes.newlyCompleted[0].milestoneId, 'ms-1');
+  assert.equal(evalRes.autoAdvanceRoute, 'billing_refund');
+  assert.equal(agentState.get('routeOverride'), 'billing_refund');
+  assert.equal(overrideNotifications, 1);
+  assert.ok(evalRes.state.overallProgress > 0.4);
+  assert.equal(evalRes.state.currentFocusId, 'ms-2');
+  assert.ok((evalRes.state.lastStateVecPreview?.length ?? 0) > 0);
+  unsub();
+});
+
+test('UnifiedRouterService routes with 3-slot ensemble, emits telemetry edges, and persists progress', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sr-ensemble-test-'));
+  try {
+    const telemetry = new TelemetryCollector();
+    const auth = new ChatGptAuthManager(tmpDir);
+    const service = new UnifiedRouterService(tmpDir, auth, telemetry);
+
+    // Lower thresholds slightly for offline fallback determinism in hermetic test
+    service.updateConfig({
+      encoderEnsemble: {
+        slots: [
+          { role: 'intent', modelId: 'local-subword-bm25', weight: 0.4, enabled: true },
+          { role: 'domain', modelId: 'local-subword-bm25', weight: 0.4, enabled: true },
+          { role: 'state', modelId: 'bge-m3', weight: 0.2, enabled: true },
+        ],
+        fusionMode: 'weighted_sum',
+        parallelLoad: true,
+      },
+    });
+    for (const r of service.getRoutes()) {
+      service.updateRoute(r.id, { scoreThreshold: 0.25 });
+    }
+
+    const decision = await service.routePrompt({
+      query: 'Write a PostgreSQL SQL query for top customers by ARR',
+      useRag: false,
+      executeProvider: false,
+    });
+    assert.equal(decision.matchedRoute, 'sql_analytics');
+    assert.equal(decision.ensembleFusionMode, 'weighted_sum');
+    assert.ok(decision.allScores[0].perEncoderScores?.intent !== undefined);
+    assert.ok(decision.allScores[0].perEncoderScores?.domain !== undefined);
+    assert.ok(decision.allScores[0].perEncoderScores?.state !== undefined);
+
+    const snap = telemetry.getSnapshot();
+    assert.ok((snap.edges.find((e) => e.id === 'router->embedding_intent')?.hitCount ?? 0) >= 1);
+    assert.ok((snap.edges.find((e) => e.id === 'router->embedding_domain')?.hitCount ?? 0) >= 1);
+    assert.ok((snap.edges.find((e) => e.id === 'router->embedding_state')?.hitCount ?? 0) >= 1);
+    assert.ok((snap.edges.find((e) => e.id === 'ensemble->router')?.hitCount ?? 0) >= 1);
+    assert.ok((snap.edges.find((e) => e.id === 'embedding_state->progress_tracker')?.hitCount ?? 0) >= 1);
+    assert.ok(snap.subsystems.some((s) => s.id === 'embedding_intent'));
+    assert.ok(snap.subsystems.some((s) => s.id === 'embedding_domain'));
+    assert.ok(snap.subsystems.some((s) => s.id === 'embedding_state'));
+    assert.ok(snap.subsystems.some((s) => s.id === 'ensemble_fusion'));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 
 

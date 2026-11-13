@@ -537,16 +537,16 @@ export function PlaygroundView({
             className="bg-white border border-slate-200 rounded-lg divide-y divide-slate-200"
           >
             <div className="p-6 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
-              <div className="space-y-1.5">
-                <div className="flex items-center gap-2 text-xs font-medium">
+              <div className="space-y-1.5 min-w-0">
+                <div className="flex flex-wrap items-center gap-2 text-xs font-medium">
                   {decision.matchedRoute ? (
-                    <span className="inline-flex items-center gap-1.5 text-emerald-700">
-                      <CheckCircle2 className="w-4 h-4" />
+                    <span className="inline-flex items-center gap-1.5 text-emerald-700 whitespace-nowrap shrink-0">
+                      <CheckCircle2 className="w-4 h-4 shrink-0" />
                       Route Matched
                     </span>
                   ) : (
-                    <span className="inline-flex items-center gap-1.5 text-amber-700">
-                      <AlertTriangle className="w-4 h-4" />
+                    <span className="inline-flex items-center gap-1.5 text-amber-700 whitespace-nowrap shrink-0">
+                      <AlertTriangle className="w-4 h-4 shrink-0" />
                       Below Threshold · Fallback to None
                     </span>
                   )}
@@ -569,27 +569,101 @@ export function PlaygroundView({
                 </div>
               </div>
 
-              <div className="grid grid-cols-3 gap-6 pt-3 lg:pt-0 border-t lg:border-t-0 border-slate-100">
+              <div className="grid grid-cols-3 gap-5 pt-3 lg:pt-0 border-t lg:border-t-0 border-slate-100 shrink-0">
                 <div>
-                  <div className="text-xs text-slate-500">Top Score</div>
-                  <div className="text-lg font-mono tabular-nums font-semibold text-slate-900 mt-0.5">
+                  <div className="text-xs text-slate-500 whitespace-nowrap">Top Score</div>
+                  <div className="text-lg font-mono tabular-nums font-semibold text-slate-900 mt-0.5 whitespace-nowrap">
                     {decision.topScore.toFixed(4)}
                   </div>
                 </div>
                 <div>
-                  <div className="text-xs text-slate-500">Threshold</div>
-                  <div className="text-lg font-mono tabular-nums font-semibold text-slate-900 mt-0.5">
+                  <div className="text-xs text-slate-500 whitespace-nowrap">Threshold</div>
+                  <div className="text-lg font-mono tabular-nums font-semibold text-slate-900 mt-0.5 whitespace-nowrap">
                     {decision.thresholdUsed !== null ? decision.thresholdUsed.toFixed(2) : '—'}
                   </div>
                 </div>
                 <div>
-                  <div className="text-xs text-slate-500">Latency</div>
-                  <div className="text-lg font-mono tabular-nums font-semibold text-slate-900 mt-0.5">
+                  <div className="text-xs text-slate-500 whitespace-nowrap">Latency</div>
+                  <div className="text-lg font-mono tabular-nums font-semibold text-slate-900 mt-0.5 whitespace-nowrap">
                     {decision.latencyMs.toFixed(2)} ms
                   </div>
                 </div>
               </div>
             </div>
+
+            {/* Per-Encoder Ensemble Breakdown */}
+            {decision.allScores.some((s) => s.perEncoderScores) && (
+              <div
+                data-testid="ensemble-breakdown-panel"
+                className="p-6 bg-slate-50/40 space-y-3"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-semibold text-slate-900">
+                    Per-Encoder Ensemble Breakdown
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3 text-xs font-mono text-slate-600">
+                    <span>Fusion: {decision.ensembleFusionMode ?? 'weighted_sum'}</span>
+                    {decision.progressAutoAdvanceRoute && (
+                      <span className="text-emerald-700 font-semibold">
+                        EM-3 Milestone Crossed · Next Hint → {decision.progressAutoAdvanceRoute}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="overflow-x-auto border border-slate-200 rounded-md bg-white">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-[11px] font-medium text-slate-600">
+                        <th className="py-2 px-3">Route</th>
+                        <th className="py-2 px-3 text-right">EM-1 Intent</th>
+                        <th className="py-2 px-3 text-right">EM-2 Domain</th>
+                        <th className="py-2 px-3 text-right">EM-3 State</th>
+                        <th className="py-2 px-3 text-right">Fused Score</th>
+                        <th className="py-2 px-3 text-right">Threshold</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200 text-xs font-mono tabular-nums">
+                      {decision.allScores.slice(0, 4).map((row) => {
+                        const isWinner = decision.matchedRouteId === row.routeId;
+                        return (
+                          <tr key={row.routeId} className={isWinner ? 'bg-blue-50/40' : ''}>
+                            <td className="py-2 px-3 font-semibold text-slate-900">
+                              {row.routeName}
+                            </td>
+                            <td className="py-2 px-3 text-right text-slate-700">
+                              {row.perEncoderScores?.intent !== undefined
+                                ? row.perEncoderScores.intent.toFixed(4)
+                                : '—'}
+                            </td>
+                            <td className="py-2 px-3 text-right text-slate-700">
+                              {row.perEncoderScores?.domain !== undefined
+                                ? row.perEncoderScores.domain.toFixed(4)
+                                : '—'}
+                            </td>
+                            <td className="py-2 px-3 text-right text-slate-700">
+                              {row.perEncoderScores?.state !== undefined
+                                ? row.perEncoderScores.state.toFixed(4)
+                                : '—'}
+                            </td>
+                            <td className="py-2 px-3 text-right font-bold text-slate-900">
+                              {(row.ensembleFusedScore ?? row.score).toFixed(4)}
+                            </td>
+                            <td
+                              className={`py-2 px-3 text-right ${
+                                row.passed ? 'text-emerald-700 font-semibold' : 'text-slate-500'
+                              }`}
+                            >
+                              {row.threshold.toFixed(2)}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
 
             {/* Retrieved RAG Chunks */}
             {decision.ragMatches && decision.ragMatches.length > 0 && (
@@ -678,12 +752,16 @@ export function PlaygroundView({
                 </pre>
 
                 {decision.appliedInstructions && (
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-[11px]">
+                  <div
+                    className={`grid grid-cols-1 gap-3 text-[11px] ${
+                      decision.appliedInstructions.chatgptSystemPrompt ? 'md:grid-cols-2' : ''
+                    }`}
+                  >
                     <div className="p-2.5 bg-white border border-slate-200 rounded">
                       <div className="font-semibold text-slate-700 mb-1">
                         Embedding LM Formatted Query
                       </div>
-                      <div className="font-mono text-slate-600 break-all">
+                      <div className="font-mono text-slate-600 break-words">
                         {decision.appliedInstructions.embeddingQueryPreview}
                       </div>
                     </div>
@@ -717,12 +795,12 @@ export function PlaygroundView({
                 <table className="w-full text-left border-collapse">
                   <thead>
                     <tr className="bg-slate-50 border-b border-slate-200 text-xs font-medium text-slate-600">
-                      <th className="py-2.5 px-3">Route</th>
-                      <th className="py-2.5 px-3 text-right">Score</th>
-                      <th className="py-2.5 px-3 text-right">Threshold</th>
-                      <th className="py-2.5 px-3 text-right">Margin</th>
-                      <th className="py-2.5 px-3 w-48">Threshold Bar</th>
-                      <th className="py-2.5 px-3">Top Utterance</th>
+                      <th className="py-2.5 px-2.5">Route</th>
+                      <th className="py-2.5 px-2.5 text-right">Score</th>
+                      <th className="py-2.5 px-2.5 text-right">Threshold</th>
+                      <th className="py-2.5 px-2.5 text-right">Margin</th>
+                      <th className="py-2.5 px-2.5 w-36">Threshold Bar</th>
+                      <th className="py-2.5 px-2.5">Top Utterance</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-200 text-sm">
@@ -735,14 +813,14 @@ export function PlaygroundView({
                       return (
                         <React.Fragment key={row.routeId}>
                           <tr className={isWinner ? 'bg-blue-50/50' : 'hover:bg-slate-50'}>
-                            <td className="py-2.5 px-3">
+                            <td className="py-2.5 px-2.5">
                               <button
                                 type="button"
                                 onClick={() =>
                                   setExpandedRouteId(isExpanded ? null : row.routeId)
                                 }
                                 aria-expanded={isExpanded}
-                                className="inline-flex items-center gap-1.5 font-mono text-xs font-semibold text-slate-900 hover:text-blue-600"
+                                className="inline-flex items-center gap-1.5 font-mono text-xs font-semibold text-slate-900 hover:text-blue-600 whitespace-nowrap"
                               >
                                 {isExpanded ? (
                                   <ChevronUp className="w-3.5 h-3.5 text-slate-400" />
@@ -751,31 +829,31 @@ export function PlaygroundView({
                                 )}
                                 {row.routeName}
                               </button>
-                              <div className="text-xs text-slate-500 pl-5">
+                              <div className="text-xs text-slate-500 pl-5 truncate max-w-[175px]">
                                 {row.routeType === 'dynamic' ? 'Dynamic' : 'Static'} ·{' '}
                                 {row.targetModel}
                               </div>
                             </td>
 
-                            <td className="py-2.5 px-3 text-right font-mono tabular-nums text-xs font-semibold text-slate-900">
+                            <td className="py-2.5 px-2.5 text-right font-mono tabular-nums text-xs font-semibold text-slate-900 whitespace-nowrap">
                               {row.score.toFixed(4)}
                             </td>
 
-                            <td className="py-2.5 px-3 text-right font-mono tabular-nums text-xs text-slate-600">
+                            <td className="py-2.5 px-2.5 text-right font-mono tabular-nums text-xs text-slate-600 whitespace-nowrap">
                               {row.threshold.toFixed(2)}
                             </td>
 
                             <td
-                              className={`py-2.5 px-3 text-right font-mono tabular-nums text-xs font-medium ${
+                              className={`py-2.5 px-2.5 text-right font-mono tabular-nums text-xs font-medium whitespace-nowrap ${
                                 row.margin >= 0 ? 'text-emerald-700' : 'text-slate-500'
                               }`}
                             >
                               {row.margin >= 0 ? `+${row.margin.toFixed(3)}` : row.margin.toFixed(3)}
                             </td>
 
-                            <td className="py-2.5 px-3">
+                            <td className="py-2.5 px-2.5">
                               <div
-                                className="relative h-2.5 w-44 bg-slate-100 rounded-xs overflow-visible border border-slate-200"
+                                className="relative h-2.5 w-32 bg-slate-100 rounded-xs overflow-visible border border-slate-200"
                                 aria-label={`${row.routeName} score ${row.score.toFixed(2)} vs threshold ${row.threshold.toFixed(2)}`}
                               >
                                 <div
@@ -796,7 +874,7 @@ export function PlaygroundView({
                               </div>
                             </td>
 
-                            <td className="py-2.5 px-3 text-xs text-slate-600 max-w-xs truncate">
+                            <td className="py-2.5 px-2.5 text-xs text-slate-600 max-w-[180px] truncate">
                               {row.topUtterance}
                             </td>
                           </tr>

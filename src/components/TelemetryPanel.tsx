@@ -26,7 +26,14 @@ interface TelemetryPanelProps {
 
 type TelemetrySubTab = 'flow' | 'endpoints' | 'payloads';
 
-type AnchorSide = 'top' | 'bottom' | 'left' | 'right' | 'bottom-left' | 'bottom-right' | 'top-right';
+type AnchorSide =
+  | 'top'
+  | 'bottom'
+  | 'left'
+  | 'right'
+  | 'bottom-left'
+  | 'bottom-right'
+  | 'top-right';
 
 interface TopologyNodeDef {
   id: string;
@@ -49,26 +56,26 @@ interface TopologyEdgeDef {
 }
 
 const TOPOLOGY_NODES: TopologyNodeDef[] = [
-  { id: 'browser', label: 'Client Browser', sublabel: 'HTTP/SSE', x: 8, y: 8, w: 102, h: 36 },
+  { id: 'browser', label: 'Client Browser', sublabel: 'HTTP/SSE', x: 10, y: 8, w: 118, h: 34 },
   {
     id: 'express',
     label: 'Express Gateway',
     sublabel: ':3000 LISTEN',
-    x: 128,
+    x: 150,
     y: 8,
-    w: 106,
-    h: 36,
+    w: 120,
+    h: 34,
     subsystem: 'semantic_router',
   },
-  { id: 'mcp', label: 'MCP Stdio', sublabel: 'stdin / stdout', x: 252, y: 8, w: 100, h: 36 },
+  { id: 'mcp', label: 'MCP Stdio', sublabel: 'stdin / stdout', x: 292, y: 8, w: 138, h: 34 },
   {
     id: 'router',
     label: 'RAG & Semantic Router',
     sublabel: 'Unified Core',
-    x: 92,
-    y: 74,
-    w: 176,
-    h: 40,
+    x: 86,
+    y: 66,
+    w: 256,
+    h: 36,
     subsystem: 'semantic_router',
   },
   {
@@ -76,50 +83,80 @@ const TOPOLOGY_NODES: TopologyNodeDef[] = [
     label: 'RAG Webhook',
     sublabel: ':443 Fetch',
     x: 8,
-    y: 146,
-    w: 102,
-    h: 38,
+    y: 134,
+    w: 76,
+    h: 36,
     subsystem: 'semantic_router',
   },
   {
     id: 'chatgpt',
     label: 'ChatGPT AI',
-    sublabel: ':443 Responses',
-    x: 128,
-    y: 146,
-    w: 106,
-    h: 38,
+    sublabel: ':443 AI',
+    x: 90,
+    y: 134,
+    w: 76,
+    h: 36,
     subsystem: 'ai_model',
   },
   {
-    id: 'bridge',
-    label: 'EmbeddingsBridge',
-    sublabel: 'IPC + Cache',
-    x: 252,
-    y: 146,
-    w: 100,
-    h: 38,
-    subsystem: 'embedding_model',
+    id: 'embedding_intent',
+    label: 'EM-1 Intent',
+    sublabel: 'e5-small-v2',
+    x: 172,
+    y: 134,
+    w: 78,
+    h: 36,
+    subsystem: 'embedding_intent',
+  },
+  {
+    id: 'embedding_domain',
+    label: 'EM-2 Domain',
+    sublabel: 'subword-bm25',
+    x: 256,
+    y: 134,
+    w: 86,
+    h: 36,
+    subsystem: 'embedding_domain',
+  },
+  {
+    id: 'embedding_state',
+    label: 'EM-3 State',
+    sublabel: 'BAAI/bge-m3',
+    x: 348,
+    y: 134,
+    w: 84,
+    h: 36,
+    subsystem: 'embedding_state',
   },
   {
     id: 'loopback',
     label: 'OAuth Loopback',
     sublabel: ':1455 PKCE',
-    x: 128,
-    y: 214,
-    w: 106,
-    h: 38,
+    x: 90,
+    y: 208,
+    w: 76,
+    h: 36,
     subsystem: 'ai_model',
   },
   {
-    id: 'embedding',
-    label: 'Embedding LM',
-    sublabel: 'e5-small-v2',
-    x: 252,
-    y: 214,
-    w: 100,
-    h: 38,
-    subsystem: 'embedding_model',
+    id: 'ensemble',
+    label: 'Ensemble Fusion',
+    sublabel: 'weighted_sum',
+    x: 172,
+    y: 208,
+    w: 170,
+    h: 36,
+    subsystem: 'ensemble_fusion',
+  },
+  {
+    id: 'progress_tracker',
+    label: 'Progress Tracker',
+    sublabel: 'Milestones',
+    x: 348,
+    y: 208,
+    w: 84,
+    h: 36,
+    subsystem: 'embedding_state',
   },
 ];
 
@@ -128,10 +165,16 @@ const TOPOLOGY_EDGES: TopologyEdgeDef[] = [
   { id: 'express->router', from: 'express', to: 'router', fromSide: 'bottom', toSide: 'top', defaultPort: 'IPC' },
   { id: 'mcp->router', from: 'mcp', to: 'router', fromSide: 'bottom', toSide: 'top-right', defaultPort: 'stdio' },
   { id: 'router->rag_connector', from: 'router', to: 'rag_connector', fromSide: 'bottom-left', toSide: 'top', defaultPort: ':443' },
-  { id: 'router->chatgpt', from: 'router', to: 'chatgpt', fromSide: 'bottom', toSide: 'top', defaultPort: ':443' },
-  { id: 'router->bridge', from: 'router', to: 'bridge', fromSide: 'bottom-right', toSide: 'top', defaultPort: 'IPC' },
+  { id: 'router->chatgpt', from: 'router', to: 'chatgpt', fromSide: 'bottom-left', toSide: 'top', defaultPort: ':443' },
+  { id: 'router->embedding_intent', from: 'router', to: 'embedding_intent', fromSide: 'bottom', toSide: 'top', defaultPort: '384d' },
+  { id: 'router->embedding_domain', from: 'router', to: 'embedding_domain', fromSide: 'bottom-right', toSide: 'top', defaultPort: '256d' },
+  { id: 'router->embedding_state', from: 'router', to: 'embedding_state', fromSide: 'right', toSide: 'top', defaultPort: '1024d' },
+  { id: 'embedding_intent->ensemble', from: 'embedding_intent', to: 'ensemble', fromSide: 'bottom', toSide: 'top', defaultPort: 'EM-1' },
+  { id: 'embedding_domain->ensemble', from: 'embedding_domain', to: 'ensemble', fromSide: 'bottom', toSide: 'top-right', defaultPort: 'EM-2' },
+  { id: 'embedding_state->ensemble', from: 'embedding_state', to: 'ensemble', fromSide: 'bottom-left', toSide: 'right', defaultPort: 'EM-3' },
+  { id: 'ensemble->router', from: 'ensemble', to: 'router', fromSide: 'left', toSide: 'bottom', defaultPort: 'Fused' },
+  { id: 'embedding_state->progress_tracker', from: 'embedding_state', to: 'progress_tracker', fromSide: 'bottom', toSide: 'top', defaultPort: '1024d' },
   { id: 'chatgpt->loopback', from: 'chatgpt', to: 'loopback', fromSide: 'bottom', toSide: 'top', defaultPort: ':1455' },
-  { id: 'bridge->embedding', from: 'bridge', to: 'embedding', fromSide: 'bottom', toSide: 'top', defaultPort: 'ONNX' },
 ];
 
 function getAnchorPoint(node: TopologyNodeDef, side: AnchorSide): { x: number; y: number } {
@@ -164,7 +207,8 @@ function computeDynamicEdgeCurve(
   const dx = p2.x - p1.x;
   const dy = p2.y - p1.y;
 
-  const isHorizontal = (fromSide === 'left' || fromSide === 'right') && (toSide === 'left' || toSide === 'right');
+  const isHorizontal =
+    (fromSide === 'left' || fromSide === 'right') && (toSide === 'left' || toSide === 'right');
   let c1x = p1.x;
   let c1y = p1.y;
   let c2x = p2.x;
@@ -173,6 +217,16 @@ function computeDynamicEdgeCurve(
   if (isHorizontal) {
     c1x = p1.x + dx * 0.5;
     c2x = p2.x - dx * 0.5;
+  } else if (fromSide === 'left' && toSide === 'bottom') {
+    c1x = p1.x - 24;
+    c1y = p1.y - 32;
+    c2x = p2.x - 10;
+    c2y = p2.y + 36;
+  } else if (fromSide === 'right' && toSide === 'top') {
+    c1x = p2.x + 12;
+    c1y = p1.y;
+    c2x = p2.x + 12;
+    c2y = p2.y - 24;
   } else {
     c1y = p1.y + dy * 0.52;
     c2y = p2.y - dy * 0.52;
@@ -327,16 +381,51 @@ export function TelemetryPanel({
       lastLatencyMs: null,
     },
     {
-      id: 'embedding_model',
-      label: 'Embedding LM',
+      id: 'ensemble_fusion',
+      label: 'Ensemble Fusion',
+      target: 'weighted_sum',
+      lamp: 'green',
+      statusText: 'ACTIVE',
+      detail: '3-slot fusion layer',
+      portOrRuntime: 'IPC Fusion',
+      lastLatencyMs: null,
+    },
+    {
+      id: 'embedding_intent',
+      label: 'EM-1 Intent',
       target: 'e5-small-v2',
       lamp: 'yellow',
       statusText: 'SYNC',
       detail: 'Checking ONNX status',
-      portOrRuntime: 'ONNX 384d',
+      portOrRuntime: 'IPC · 384d',
+      lastLatencyMs: null,
+    },
+    {
+      id: 'embedding_domain',
+      label: 'EM-2 Domain',
+      target: 'local-subword-bm25',
+      lamp: 'green',
+      statusText: 'READY',
+      detail: '256d domain + BM25 slot',
+      portOrRuntime: 'IPC · 256d',
+      lastLatencyMs: null,
+    },
+    {
+      id: 'embedding_state',
+      label: 'EM-3 State',
+      target: 'bge-m3',
+      lamp: 'green',
+      statusText: 'READY',
+      detail: '1024d milestone tracker',
+      portOrRuntime: 'IPC · 1024d',
       lastLatencyMs: null,
     },
   ];
+
+  // Show the 6 distinct operational units in the traffic-light matrix (exclude legacy duplicate embedding_model when EM-1..3 exist)
+  const displaySubsystems = subsystems.some((s) => s.id === 'embedding_intent')
+    ? subsystems.filter((s) => s.id !== 'embedding_model')
+    : subsystems;
 
   const endpoints = (telemetry?.endpoints ?? []).filter(
     (ep) => !selectedSubsystem || ep.subsystem === selectedSubsystem
@@ -345,7 +434,10 @@ export function TelemetryPanel({
 
   const aiSub = subsystems.find((s) => s.id === 'ai_model');
   const routerSub = subsystems.find((s) => s.id === 'semantic_router');
-  const embedSub = subsystems.find((s) => s.id === 'embedding_model');
+  const intentSub = subsystems.find((s) => s.id === 'embedding_intent');
+  const domainSub = subsystems.find((s) => s.id === 'embedding_domain');
+  const stateSub = subsystems.find((s) => s.id === 'embedding_state');
+  const fusionSub = subsystems.find((s) => s.id === 'ensemble_fusion');
 
   const nodeMap = useMemo(() => {
     const map = new Map<string, TopologyNodeDef>();
@@ -473,7 +565,7 @@ export function TelemetryPanel({
           data-testid="telemetry-traffic-lights"
           className="grid grid-cols-3 gap-2 items-stretch"
         >
-          {subsystems.map((sub) => {
+          {displaySubsystems.map((sub) => {
             const isSelected = selectedSubsystem === sub.id;
             return (
               <button
@@ -483,7 +575,7 @@ export function TelemetryPanel({
                 onClick={() =>
                   setSelectedSubsystem((prev) => (prev === sub.id ? null : sub.id))
                 }
-                className={`flex flex-col items-center text-center p-2.5 rounded-md border transition-colors ${
+                className={`flex flex-col items-center text-center p-2 rounded-md border transition-colors ${
                   isSelected
                     ? 'bg-blue-50/50 border-blue-600 ring-1 ring-blue-600'
                     : 'bg-slate-50/60 border-slate-200 hover:border-slate-300 hover:bg-slate-50'
@@ -491,7 +583,7 @@ export function TelemetryPanel({
               >
                 <TrafficLightHousing lamp={sub.lamp} label={sub.label} />
 
-                <div className="mt-2 space-y-0.5 w-full">
+                <div className="mt-1.5 space-y-0.5 w-full">
                   <div className="text-[11px] font-semibold text-slate-900 truncate">
                     {sub.label}
                   </div>
@@ -511,7 +603,7 @@ export function TelemetryPanel({
 
         {/* Concise Runtime Detail Readout Row */}
         <div className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded px-3 py-2 space-y-1">
-          {subsystems
+          {displaySubsystems
             .filter((s) => !selectedSubsystem || s.id === selectedSubsystem)
             .map((s) => (
               <div key={s.id} className="flex items-center justify-between gap-2">
@@ -588,10 +680,10 @@ export function TelemetryPanel({
 
               <div className="bg-slate-950 border border-slate-800 rounded-md p-2">
                 <svg
-                  viewBox="0 0 360 262"
+                  viewBox="0 0 440 256"
                   className="w-full h-auto"
                   role="img"
-                  aria-label="Dynamic millisecond-live network topology across Browser, MCP stdio, Express Gateway, RAG Semantic Router, EmbeddingsBridge, Embedding LM, RAG Webhook, ChatGPT AI, and OAuth Loopback"
+                  aria-label="Dynamic millisecond-live network topology across Browser, Express Gateway, MCP stdio, RAG Semantic Router, EM-1 Intent, EM-2 Domain, EM-3 State, Ensemble Fusion, Progress Tracker, RAG Webhook, ChatGPT AI, and OAuth Loopback"
                 >
                   <defs>
                     <filter id="port-glow-blue" x="-30%" y="-30%" width="160%" height="160%">
@@ -737,10 +829,20 @@ export function TelemetryPanel({
                       dynamicSub = telemetry?.mcpEnabled === false ? 'disabled' : 'stdin/stdout';
                     } else if (node.id === 'loopback') {
                       dynamicSub = `:${telemetry?.loopbackPort ?? 1455} ${telemetry?.loopbackListening ? 'LISTEN' : 'IDLE'}`;
-                    } else if (node.id === 'embedding') {
+                    } else if (node.id === 'embedding_intent') {
+                      dynamicSub = intentSub?.target ?? 'e5-small-v2';
+                    } else if (node.id === 'embedding_domain') {
+                      const rawTarget = domainSub?.target ?? 'subword-bm25';
+                      dynamicSub = rawTarget === 'local-subword-bm25' ? 'subword-bm25' : rawTarget;
+                    } else if (node.id === 'embedding_state') {
+                      dynamicSub = stateSub?.target ?? 'bge-m3';
+                    } else if (node.id === 'ensemble') {
+                      dynamicSub = fusionSub?.target ?? 'weighted_sum';
+                    } else if (node.id === 'progress_tracker') {
                       dynamicSub =
-                        telemetry?.subsystems.find((s) => s.id === 'embedding_model')?.target ??
-                        'e5-small-v2';
+                        typeof telemetry?.progressOverall === 'number'
+                          ? `${Math.round(telemetry.progressOverall * 100)}% align`
+                          : 'Milestones';
                     } else if (node.id === 'chatgpt') {
                       dynamicSub = `:443 ${aiSub?.statusText ?? 'STANDBY'}`;
                     } else if (node.id === 'router') {
@@ -771,7 +873,7 @@ export function TelemetryPanel({
                           y={node.y + 14.5}
                           textAnchor="middle"
                           fill="#F8FAFC"
-                          fontSize="8.3"
+                          fontSize="7.9"
                           fontWeight="600"
                           fontFamily="Plus Jakarta Sans, sans-serif"
                         >

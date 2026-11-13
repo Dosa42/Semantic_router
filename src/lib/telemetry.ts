@@ -1,5 +1,7 @@
 import type {
   EncoderModelId,
+  EnsembleFusionMode,
+  EnsembleSlotRuntimeStatus,
   TelemetryEdgeId,
   TelemetryEdgeState,
   TelemetryEndpointMetric,
@@ -131,6 +133,20 @@ export function classifyEndpointTelemetry(
       targetNode: 'rag-connector',
     };
   }
+  if (pathOnly.startsWith('/api/progress')) {
+    return {
+      routePattern: `${cleanMethod} ${pathOnly}`,
+      subsystem: 'embedding_state',
+      targetNode: 'em3-progress-tracker',
+    };
+  }
+  if (pathOnly.startsWith('/api/agent-state')) {
+    return {
+      routePattern: `${cleanMethod} ${pathOnly}`,
+      subsystem: 'ensemble_fusion',
+      targetNode: 'agent-state-store',
+    };
+  }
   if (pathOnly.startsWith('/api/mcp')) {
     return {
       routePattern: `${cleanMethod} ${pathOnly}`,
@@ -170,6 +186,11 @@ export interface SubsystemStateInput {
   ragChunkCount?: number;
   lastRagLatencyMs?: number | null;
   lastRagError?: string | null;
+  ensembleActive?: boolean;
+  fusionMode?: EnsembleFusionMode;
+  slotStatuses?: EnsembleSlotRuntimeStatus[];
+  progressOverall?: number;
+  activeFocusLabel?: string | null;
 }
 
 export function computeSubsystemSignals(input: SubsystemStateInput): {
@@ -217,7 +238,7 @@ export function computeSubsystemSignals(input: SubsystemStateInput): {
     routerDetail = 'Evaluating dataset / fitting route thresholds';
   }
 
-  // 3. Right: Embedding Model (intfloat/e5-small-v2 ONNX or BM25)
+  // 3. Right: Embedding Model (aggregate + per-slot EM-1/EM-2/EM-3 + Ensemble Fusion)
   let embedLamp: TelemetrySubsystemStatus['lamp'] = 'yellow';
   let embedStatusText = 'WARMING';
   let embedDetail = 'Loading Xenova/e5-small-v2 q8 ONNX weights';
@@ -239,6 +260,22 @@ export function computeSubsystemSignals(input: SubsystemStateInput): {
     embedDetail = 'Awaiting ONNX warmup request';
   }
 
+  const slotMap = new Map((input.slotStatuses ?? []).map((s) => [s.role, s]));
+  const mapSlotLamp = (
+    role: 'intent' | 'domain' | 'state',
+    fallbackLamp: TelemetrySubsystemStatus['lamp']
+  ): TelemetrySubsystemStatus['lamp'] => {
+    const slot = slotMap.get(role);
+    if (!slot) return fallbackLamp;
+    if (slot.status === 'ready') return 'green';
+    if (slot.status === 'error') return 'red';
+    return 'yellow';
+  };
+
+  const intentSlot = slotMap.get('intent');
+  const domainSlot = slotMap.get('domain');
+  const stateSlot = slotMap.get('state');
+
   const subsystems: TelemetrySubsystemStatus[] = [
     {
       id: 'ai_model',
@@ -257,18 +294,70 @@ export function computeSubsystemSignals(input: SubsystemStateInput): {
       lamp: routerLamp,
       statusText: routerStatusText,
       detail: routerDetail,
-      portOrRuntime: input.mcpEnabled === false ? `:${input.expressPort} HTTP` : `:${input.expressPort} + stdio`,
+      portOrRuntime:
+        input.mcpEnabled === false ? `:${input.expressPort} HTTP` : `:${input.expressPort} + stdio`,
       lastLatencyMs: input.lastRouteLatencyMs,
     },
     {
       id: 'embedding_model',
       label: 'Embedding LM',
-      target: input.encoderModel === 'e5-small-v2' ? 'e5-small-v2' : 'subword-bm25',
+      target: input.encoderModel === 'e5-small-v2' ? 'e5-small-v2' : input.encoderModel,
       lamp: embedLamp,
       statusText: embedStatusText,
       detail: embedDetail,
       portOrRuntime: 'ONNX 384d',
       lastLatencyMs: input.lastEmbedLatencyMs,
+    },
+    {
+      id: 'embedding_intent',
+      label: 'EM-1 Intent',
+      target: intentSlot?.modelId ?? 'e5-small-v2',
+      lamp: mapSlotLamp('intent', embedLamp),
+      statusText: intentSlot ? intentSlot.status.toUpperCase() : embedStatusText,
+      detail: intentSlot
+        ? `${intentSlot.dimensions}d (${intentSlot.backend}) · ${intentSlot.cachedCount} cached`
+        : '384d intent classification slot',
+      portOrRuntime: `IPC · ${intentSlot?.dimensions ?? 384}d`,
+      lastLatencyMs: intentSlot?.lastLatencyMs ?? input.lastEmbedLatencyMs,
+    },
+    {
+      id: 'embedding_domain',
+      label: 'EM-2 Domain',
+      target: domainSlot?.modelId ?? 'local-subword-bm25',
+      lamp: mapSlotLamp('domain', 'green'),
+      statusText: domainSlot ? domainSlot.status.toUpperCase() : 'READY',
+      detail: domainSlot
+        ? `${domainSlot.dimensions}d (${domainSlot.backend}) · ${domainSlot.cachedCount} cached`
+        : '256d domain + BM25 hybrid slot',
+      portOrRuntime: `IPC · ${domainSlot?.dimensions ?? 256}d`,
+      lastLatencyMs: domainSlot?.lastLatencyMs ?? input.lastEmbedLatencyMs,
+    },
+    {
+      id: 'embedding_state',
+      label: 'EM-3 State',
+      target: stateSlot?.modelId ?? 'bge-m3',
+      lamp: mapSlotLamp('state', 'green'),
+      statusText: stateSlot ? stateSlot.status.toUpperCase() : 'READY',
+      detail:
+        typeof input.progressOverall === 'number'
+          ? `Progress ${(input.progressOverall * 100).toFixed(0)}%${
+              input.activeFocusLabel ? ` · ${input.activeFocusLabel}` : ''
+            }`
+          : '1024d milestone state tracker',
+      portOrRuntime: `IPC · ${stateSlot?.dimensions ?? 1024}d`,
+      lastLatencyMs: stateSlot?.lastLatencyMs ?? input.lastEmbedLatencyMs,
+    },
+    {
+      id: 'ensemble_fusion',
+      label: 'Ensemble Fusion',
+      target: input.fusionMode ?? 'weighted_sum',
+      lamp: input.ensembleActive ? 'green' : 'yellow',
+      statusText: input.ensembleActive ? 'ACTIVE' : 'SINGLE',
+      detail: input.ensembleActive
+        ? `3-slot fusion (${input.fusionMode ?? 'weighted_sum'})`
+        : 'Single-encoder compatibility mode',
+      portOrRuntime: 'IPC Fusion',
+      lastLatencyMs: input.lastRouteLatencyMs,
     },
   ];
 
@@ -312,6 +401,18 @@ export function computeSubsystemSignals(input: SubsystemStateInput): {
             : 'warming',
       detail: `${input.encoderModel} inference worker`,
       subsystem: 'embedding_model',
+    },
+    {
+      port: 0,
+      protocol: 'IPC',
+      service: 'Ensemble Fusion & Progress Tracker',
+      state: input.ensembleActive ? 'ready' : 'standby',
+      detail: `${input.fusionMode ?? 'weighted_sum'} fusion · ${
+        typeof input.progressOverall === 'number'
+          ? `${Math.round(input.progressOverall * 100)}% milestone alignment`
+          : 'EM-3 state tracking'
+      }`,
+      subsystem: 'ensemble_fusion',
     },
     {
       port: 443,
@@ -397,6 +498,70 @@ const DEFAULT_EDGE_DEFS: Array<{
     protocol: 'ONNX',
   },
   {
+    id: 'router->embedding_intent',
+    from: 'router',
+    to: 'embedding_intent',
+    label: 'EM-1 Intent',
+    portOrChannel: '384d',
+    protocol: 'ONNX',
+  },
+  {
+    id: 'router->embedding_domain',
+    from: 'router',
+    to: 'embedding_domain',
+    label: 'EM-2 Domain',
+    portOrChannel: '256d',
+    protocol: 'IPC',
+  },
+  {
+    id: 'router->embedding_state',
+    from: 'router',
+    to: 'embedding_state',
+    label: 'EM-3 State',
+    portOrChannel: '1024d',
+    protocol: 'IPC',
+  },
+  {
+    id: 'embedding_intent->ensemble',
+    from: 'embedding_intent',
+    to: 'ensemble',
+    label: 'Score Intent',
+    portOrChannel: 'vec',
+    protocol: 'IPC',
+  },
+  {
+    id: 'embedding_domain->ensemble',
+    from: 'embedding_domain',
+    to: 'ensemble',
+    label: 'Score Domain',
+    portOrChannel: 'vec',
+    protocol: 'IPC',
+  },
+  {
+    id: 'embedding_state->ensemble',
+    from: 'embedding_state',
+    to: 'ensemble',
+    label: 'Score State',
+    portOrChannel: 'vec',
+    protocol: 'IPC',
+  },
+  {
+    id: 'ensemble->router',
+    from: 'ensemble',
+    to: 'router',
+    label: 'Fused Decision',
+    portOrChannel: 'IPC',
+    protocol: 'IPC',
+  },
+  {
+    id: 'embedding_state->progress_tracker',
+    from: 'embedding_state',
+    to: 'progress_tracker',
+    label: 'Milestones',
+    portOrChannel: '1024d',
+    protocol: 'IPC',
+  },
+  {
     id: 'router->rag_connector',
     from: 'router',
     to: 'rag_connector',
@@ -432,6 +597,10 @@ const DEFAULT_ENDPOINTS: Array<{
   { method: 'POST', path: '/api/evaluate', subsystem: 'semantic_router', targetNode: 'semantic-router-rag' },
   { method: 'POST', path: '/api/fit', subsystem: 'semantic_router', targetNode: 'semantic-router-rag' },
   { method: 'GET', path: '/api/routes', subsystem: 'semantic_router', targetNode: 'semantic-router-rag' },
+  { method: 'GET', path: '/api/progress', subsystem: 'embedding_state', targetNode: 'em3-progress-tracker' },
+  { method: 'POST', path: '/api/progress/evaluate', subsystem: 'embedding_state', targetNode: 'em3-progress-tracker' },
+  { method: 'PUT', path: '/api/progress/milestones', subsystem: 'embedding_state', targetNode: 'em3-progress-tracker' },
+  { method: 'GET', path: '/api/agent-state', subsystem: 'ensemble_fusion', targetNode: 'agent-state-store' },
   { method: 'GET', path: '/api/instructions', subsystem: 'embedding_model', targetNode: 'e5-onnx-worker' },
   { method: 'PUT', path: '/api/instructions', subsystem: 'embedding_model', targetNode: 'e5-onnx-worker' },
   { method: 'GET', path: '/api/rag/connectors', subsystem: 'semantic_router', targetNode: 'rag-connector' },
@@ -669,6 +838,8 @@ export class TelemetryCollector {
       mcpCallCount: state.mcpCallCount ?? 0,
       ragConnectorCount: state.ragConnectorCount ?? 0,
       ragChunkCount: state.ragChunkCount ?? 0,
+      ensembleActive: state.ensembleActive ?? false,
+      progressOverall: state.progressOverall,
       activeFlowEdge: this.activeFlowEdge,
       edges: Array.from(this.edgeMap.values()).map((e) => ({ ...e })),
       subsystems,

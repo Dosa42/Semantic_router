@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import {
   BarChart3,
   Code2,
+  Compass,
   Cpu,
   GitBranch,
   Menu,
@@ -17,6 +18,7 @@ import { ChatGptAuthModal } from './components/ChatGptAuthModal';
 import { EvaluationView } from './components/EvaluationView';
 import { InstructionsView } from './components/InstructionsView';
 import { PlaygroundView } from './components/PlaygroundView';
+import { ProgressDashboard } from './components/ProgressDashboard';
 import { ProvidersView } from './components/ProvidersView';
 import { RouteEditorModal } from './components/RouteEditorModal';
 import { RoutesView } from './components/RoutesView';
@@ -26,16 +28,22 @@ import {
   DEFAULT_ROUTER_CONFIG,
   DEFAULT_SYSTEM_INSTRUCTIONS,
   SAMPLE_PLAYGROUND_PROMPTS,
+  SEED_PROJECT_MILESTONES,
 } from './lib/seedData';
 import type {
+  AgentStateSnapshot,
   AggregationStrategy,
   ChatGptSessionState,
   EncoderModelId,
+  EnsembleConfig,
+  EnsembleSlotRuntimeStatus,
   EvalCase,
   EvalReport,
   FitReport,
   FunctionParameter,
   LibraryKnowledgeState,
+  ProjectMilestone,
+  ProjectProgressState,
   RagConnector,
   RagParserMode,
   RouteDecisionResult,
@@ -49,12 +57,20 @@ import type {
   TelemetrySnapshot,
 } from './lib/types';
 
-type NavTab = 'playground' | 'routes' | 'instructions' | 'evaluation' | 'providers' | 'sdk';
+type NavTab =
+  | 'playground'
+  | 'routes'
+  | 'instructions'
+  | 'progress'
+  | 'evaluation'
+  | 'providers'
+  | 'sdk';
 
 const TAB_LABELS: Record<NavTab, string> = {
   playground: 'Playground',
   routes: 'Routes',
   instructions: 'System Instructions',
+  progress: 'Progress',
   evaluation: 'Evaluation & Fit',
   providers: 'Providers & E5',
   sdk: 'SDK & API',
@@ -95,6 +111,57 @@ export default function App() {
   const [telemetry, setTelemetry] = useState<TelemetrySnapshot | null>(null);
   const [telemetryStreamConnected, setTelemetryStreamConnected] = useState(false);
   const [probingTelemetry, setProbingTelemetry] = useState(false);
+  const [slotStatuses, setSlotStatuses] = useState<EnsembleSlotRuntimeStatus[]>([]);
+  const [progressState, setProgressState] = useState<ProjectProgressState>(() => ({
+    sessionId: 'sess-init',
+    milestones: structuredClone(SEED_PROJECT_MILESTONES),
+    progress: SEED_PROJECT_MILESTONES.map((m) => ({
+      milestoneId: m.id,
+      label: m.label,
+      score: 0,
+      completed: false,
+    })),
+    overallProgress: 0,
+    currentFocusId: SEED_PROJECT_MILESTONES[0]?.id ?? null,
+    lastUpdatedAt: new Date().toISOString(),
+  }));
+  const [agentState, setAgentState] = useState<AgentStateSnapshot>({
+    currentFocusId: SEED_PROJECT_MILESTONES[0]?.id ?? null,
+    routeOverride: null,
+    lastCompletedMilestoneId: null,
+    sessionMemoryLog: [],
+    values: {},
+  });
+
+  const refreshProgressState = useCallback(async () => {
+    try {
+      const res = await fetch('/api/progress');
+      if (res.ok) {
+        const data = (await res.json()) as {
+          progressState: ProjectProgressState;
+          agentState: AgentStateSnapshot;
+        };
+        setProgressState(data.progressState);
+        setAgentState(data.agentState);
+      }
+    } catch {
+      // Non-blocking
+    }
+  }, []);
+
+  const refreshProviderStatuses = useCallback(async () => {
+    try {
+      const res = await fetch('/api/providers');
+      if (res.ok) {
+        const data = (await res.json()) as {
+          slotStatuses?: EnsembleSlotRuntimeStatus[];
+        };
+        if (data.slotStatuses) setSlotStatuses(data.slotStatuses);
+      }
+    } catch {
+      // Non-blocking
+    }
+  }, []);
 
   const runRouteQuery = useCallback(async (query: string, useRag?: boolean) => {
     setRoutingLoading(true);
@@ -118,12 +185,14 @@ export default function App() {
         },
         ...prev.slice(0, 19),
       ]);
+      void refreshProgressState();
+      void refreshProviderStatuses();
     } catch (err) {
       setRoutingError((err as Error).message || 'Routing failed');
     } finally {
       setRoutingLoading(false);
     }
-  }, []);
+  }, [refreshProgressState, refreshProviderStatuses]);
 
   const refreshRagState = useCallback(async () => {
     try {
@@ -154,6 +223,8 @@ export default function App() {
         instructions?: SystemInstructionsConfig;
         ragConnectors?: RagConnector[];
         ragChunksCount?: number;
+        progressState?: ProjectProgressState;
+        agentState?: AgentStateSnapshot;
       };
       setRoutes(data.routes);
       setEvalCases(data.evalCases);
@@ -161,12 +232,15 @@ export default function App() {
       if (data.instructions) setInstructions(data.instructions);
       if (data.ragConnectors) setRagConnectors(data.ragConnectors);
       if (typeof data.ragChunksCount === 'number') setRagChunksCount(data.ragChunksCount);
+      if (data.progressState) setProgressState(data.progressState);
+      if (data.agentState) setAgentState(data.agentState);
+      void refreshProviderStatuses();
     } catch (err) {
       setGlobalError((err as Error).message || 'Unable to connect to router server');
     } finally {
       setLoadingInitial(false);
     }
-  }, []);
+  }, [refreshProviderStatuses]);
 
   const loadChatGptSession = useCallback(async () => {
     try {
@@ -301,14 +375,62 @@ export default function App() {
         const data = (await res.json()) as {
           config: RouterConfig;
           routes?: RouteDefinition[];
+          slotStatuses?: EnsembleSlotRuntimeStatus[];
         };
         setConfig(data.config);
         if (data.routes) {
           setRoutes(data.routes);
         }
+        if (data.slotStatuses) {
+          setSlotStatuses(data.slotStatuses);
+        }
       }
     } catch {
       // Keep optimistic state if offline
+    }
+  };
+
+  const handleUpdateEnsemble = async (encoderEnsemble: EnsembleConfig) => {
+    await handleUpdateConfig({ encoderEnsemble });
+  };
+
+  const handleEvaluateProgress = async (outputText: string) => {
+    const res = await fetch('/api/progress/evaluate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ outputText }),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as {
+        progressState: ProjectProgressState;
+        agentState: AgentStateSnapshot;
+      };
+      setProgressState(data.progressState);
+      setAgentState(data.agentState);
+    }
+  };
+
+  const handleSaveMilestones = async (milestones: ProjectMilestone[]) => {
+    const res = await fetch('/api/progress/milestones', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ milestones }),
+    });
+    if (res.ok) {
+      const data = (await res.json()) as {
+        progressState: ProjectProgressState;
+        agentState: AgentStateSnapshot;
+      };
+      setProgressState(data.progressState);
+      setAgentState(data.agentState);
+    }
+  };
+
+  const handleClearRouteOverride = async () => {
+    const res = await fetch('/api/agent-state/clear-override', { method: 'POST' });
+    if (res.ok) {
+      const data = (await res.json()) as { agentState: AgentStateSnapshot };
+      setAgentState(data.agentState);
     }
   };
 
@@ -522,6 +644,7 @@ export default function App() {
     { id: 'playground', label: 'Playground', icon: Terminal },
     { id: 'routes', label: 'Routes', icon: GitBranch },
     { id: 'instructions', label: 'System Instructions', icon: SlidersHorizontal },
+    { id: 'progress', label: 'Progress', icon: Compass },
     { id: 'evaluation', label: 'Evaluation & Fit', icon: BarChart3 },
     { id: 'providers', label: 'Providers & E5', icon: Cpu },
     { id: 'sdk', label: 'SDK & API', icon: Code2 },
@@ -605,6 +728,7 @@ export default function App() {
           >
             <option value="e5-small-v2">intfloat/e5-small-v2</option>
             <option value="local-subword-bm25">subword-256d-bm25</option>
+            <option value="bge-m3">BAAI/bge-m3</option>
           </select>
         </div>
 
@@ -844,6 +968,17 @@ export default function App() {
                 />
               )}
 
+              {activeTab === 'progress' && (
+                <ProgressDashboard
+                  progressState={progressState}
+                  agentState={agentState}
+                  routes={routes}
+                  onEvaluateOutput={handleEvaluateProgress}
+                  onSaveMilestones={handleSaveMilestones}
+                  onClearRouteOverride={handleClearRouteOverride}
+                />
+              )}
+
               {activeTab === 'evaluation' && (
                 <EvaluationView
                   routes={routes}
@@ -862,9 +997,11 @@ export default function App() {
               {activeTab === 'providers' && (
                 <ProvidersView
                   config={config}
+                  slotStatuses={slotStatuses}
                   onSelectEncoder={(encoderModel) =>
                     handleUpdateConfig({ encoderModel, calibrateThresholds: true })
                   }
+                  onUpdateEnsemble={handleUpdateEnsemble}
                 />
               )}
 

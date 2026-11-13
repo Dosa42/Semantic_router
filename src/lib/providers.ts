@@ -1,4 +1,4 @@
-import type { EncoderModelId, ProviderExecutionResult } from './types.ts';
+import type { EmbeddingSlotRole, EncoderModelId, ProviderExecutionResult } from './types.ts';
 
 export interface EncoderProviderInfo {
   id: EncoderModelId;
@@ -9,6 +9,7 @@ export interface EncoderProviderInfo {
   prefixScheme: string;
   description: string;
   recommendedThreshold: number;
+  defaultRole: EmbeddingSlotRole;
 }
 
 export interface RouteProviderFunctionInfo {
@@ -29,8 +30,9 @@ export const ENCODER_PROVIDERS: EncoderProviderInfo[] = [
     dimensions: 384,
     prefixScheme: 'Asymmetric ("query: " / "passage: ")',
     description:
-      'Local 384-dim E5 bi-encoder running quantized ONNX inference on CPU with asymmetric query/passage prefixes.',
+      'EM-1 Intent classifier encoder — local 384-dim E5 bi-encoder running quantized ONNX inference on CPU with asymmetric prefixes.',
     recommendedThreshold: 0.62,
+    defaultRole: 'intent',
   },
   {
     id: 'local-subword-bm25',
@@ -40,8 +42,21 @@ export const ENCODER_PROVIDERS: EncoderProviderInfo[] = [
     dimensions: 256,
     prefixScheme: 'Normalized token + char 3-gram',
     description:
-      'Zero-dependency sub-millisecond vector projection paired with IDF-weighted sparse lexical scoring.',
+      'EM-2 Domain/RAG hybrid encoder — zero-dependency sub-millisecond vector projection paired with IDF-weighted sparse lexical scoring.',
     recommendedThreshold: 0.36,
+    defaultRole: 'domain',
+  },
+  {
+    id: 'bge-m3',
+    providerName: 'HuggingFace / BAAI',
+    modelName: 'BAAI/bge-m3',
+    sdkClass: 'HuggingFaceEncoder(name="BAAI/bge-m3")',
+    dimensions: 1024,
+    prefixScheme: 'Asymmetric ("Represent this sentence: " prefix)',
+    description:
+      'EM-3 State/progress tracker encoder — 1024-dim multilingual dense model for tracking semantic distance to project milestones.',
+    recommendedThreshold: 0.7,
+    defaultRole: 'state',
   },
 ];
 
